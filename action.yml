@@ -1,0 +1,17 @@
+name: 'Docs Backport Action'
+description: 'Backports changes from main documentation folders to versioned folders in Docusaurus projects'
+author: 'loft-sh'
+
+inputs:
+  github_token:
+    description: 'GitHub token to authenticate API requests'
+    required: true
+    default: ${{ github.token }}
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+
+branding:
+  icon: 'copy'
+  color: 'blue'

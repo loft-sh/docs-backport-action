@@ -1,0 +1,36 @@
+name: run-lint-and-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      
+      # Verify dist/ has been correctly built and committed
+      - name: Check dist/ updates
+        run: |
+          if [[ $(git status --porcelain dist/) ]]; then
+            echo "The dist/ folder is not up to date. Please run 'npm run build' and commit the changes."
+            git status --porcelain dist/
+            exit 1
+          fi
