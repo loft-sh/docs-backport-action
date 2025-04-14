@@ -1,0 +1,33 @@
+name: update-major-version-tag
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  update-major-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          
+      - name: Get tag name
+        id: get_tag
+        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        
+      - name: Extract major version
+        id: extract_major
+        run: |
+          TAG="${{ steps.get_tag.outputs.TAG }}"
+          MAJOR="v${TAG#v*.*.*}"
+          MAJOR="v${MAJOR%%.*}"
+          echo "MAJOR_VERSION=${MAJOR}" >> $GITHUB_OUTPUT
+          
+      - name: Update or create major version tag
+        run: |
+          git config --global user.email "loft-bot@users.noreply.github.com"
+          git config --global user.name "Loft Bot"
+          git tag -f ${{ steps.extract_major.outputs.MAJOR_VERSION }} ${{ steps.get_tag.outputs.TAG }}
+          git push -f origin ${{ steps.extract_major.outputs.MAJOR_VERSION }}
