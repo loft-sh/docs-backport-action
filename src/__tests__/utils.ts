@@ -67,7 +67,7 @@ export const createMockContext = (overrides: any = {}): Partial<Context> => {
       pull_request: {
         number: 123,
         merged: true,
-        labels: [{ name: 'backport-v0.22' }, { name: 'backport-v4.2' }],
+        labels: [{ name: 'backport-v0.22' }, { name: 'backport-v4.2' }, { name: 'backport-v0.24' }],
         head: { sha: 'abc123' }
       },
       repository: {

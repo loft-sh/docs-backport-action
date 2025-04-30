@@ -30021,7 +30021,12 @@ async function run() {
                 continue;
             }
             // Construct the versioned folder path based on our folder structure
-            const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${version}`;
+            // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
+            let formattedVersion = version;
+            if (targetMainFolder === 'vcluster' && !version.match(/\.\d+$/)) {
+                formattedVersion = `${version}.0`;
+            }
+            const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
             // Create a branch for this backport
             const timestamp = new Date().getTime();
             const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
