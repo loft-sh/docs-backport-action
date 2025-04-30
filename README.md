@@ -84,6 +84,19 @@ npm run test:coverage
 2. To create a new release, use the "Release" GitHub workflow with the desired version number.
 3. After a release is created, the major version tag (e.g., `v1`) is automatically updated.
 
+#### Manually updating the v1 tag
+
+If you need to manually update the v1 tag to point to the current commit:
+
+```bash
+# Update the local v1 tag to point to the current commit
+git tag -f v1
+
+# Force push the updated tag to the remote repository
+# Use --no-verify if you have pre-push hooks that would block the push
+git push -f origin v1 --no-verify
+```
+
 ## License
 
 MIT

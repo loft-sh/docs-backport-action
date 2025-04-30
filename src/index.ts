@@ -18,7 +18,8 @@ interface GitHubLabel {
   description?: string;
 }
 
-async function run(): Promise<void> {
+// Main function, exported for testing
+export async function run(): Promise<void> {
   try {
     // Get inputs
     const token = core.getInput('github_token', { required: true });
@@ -36,6 +37,21 @@ async function run(): Promise<void> {
     const prNumber = context.payload.pull_request.number;
     const merged = context.payload.pull_request.merged || false;
     const labels = context.payload.pull_request.labels || [];
+    
+    // For label events, only proceed if the added label is a backport label
+    if (context.payload.action === 'labeled') {
+      const addedLabel = context.payload.label?.name || '';
+      if (!addedLabel.match(VERSION_LABEL_REGEX)) {
+        core.info(`Added label "${addedLabel}" is not a backport label, skipping`);
+        return;
+      }
+      
+      // Only process label events if the PR is already merged
+      if (!merged) {
+        core.info('PR is labeled but not merged yet, skipping backport until merge');
+        return;
+      }
+    }
     
     // If not merged and not a label event, skip
     if (!merged && context.payload.action !== 'labeled') {
@@ -89,10 +105,25 @@ async function run(): Promise<void> {
         continue;
       }
       
+      // Check if a backport PR already exists for this PR and version
+      const existingPR = await checkExistingBackportPR(
+        octokit, 
+        context, 
+        targetMainFolder, 
+        version, 
+        prNumber
+      );
+      
+      if (existingPR) {
+        core.info(`Backport PR #${existingPR.number} already exists for ${targetMainFolder} to v${version}, skipping`);
+        continue;
+      }
+      
       // Construct the versioned folder path based on our folder structure
       // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
+      // For vcluster versions, always add .0 suffix
       let formattedVersion = version;
-      if (targetMainFolder === 'vcluster' && !version.match(/\.\d+$/)) {
+      if (targetMainFolder === 'vcluster') {
         formattedVersion = `${version}.0`;
       }
       const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
@@ -104,8 +135,8 @@ async function run(): Promise<void> {
       // Create the branch
       await createBranchForBackport(octokit, context, branchName);
       
-      // Process files
-      await backportFiles(
+      // Process files and get stats
+      const stats = await backportFiles(
         octokit, 
         context, 
         targetMainFolder, 
@@ -114,15 +145,20 @@ async function run(): Promise<void> {
         branchName
       );
       
-      // Create a PR
-      await createBackportPR(
-        octokit, 
-        context, 
-        branchName, 
-        targetMainFolder, 
-        version, 
-        prNumber
-      );
+      // Only create a PR if we successfully copied at least one file
+      if (stats.copied > 0) {
+        // Create a PR
+        await createBackportPR(
+          octokit, 
+          context, 
+          branchName, 
+          targetMainFolder, 
+          version, 
+          prNumber
+        );
+      } else {
+        core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
+      }
     }
     
   } catch (error: any) {
@@ -158,6 +194,13 @@ async function createBranchForBackport(
   core.info(`Created branch ${branchName}`);
 }
 
+// Interface for backport statistics
+interface BackportStats {
+  copied: number;
+  skipped: number;
+  errors: number;
+}
+
 async function backportFiles(
   octokit: any, 
   context: any, 
@@ -165,7 +208,7 @@ async function backportFiles(
   versionedFolder: string, 
   files: any[], 
   branchName: string
-): Promise<void> {
+): Promise<BackportStats> {
   // Track stats for reporting
   let copied = 0;
   let skipped = 0;
@@ -196,13 +239,28 @@ async function backportFiles(
         ref: context.payload.pull_request.head.sha
       });
       
+      // Check if the target file already exists to get its SHA
+      let sha = '';
+      try {
+        const { data: existingFile } = await octokit.rest.repos.getContent({
+          ...context.repo,
+          path: targetPath,
+          ref: branchName
+        });
+        sha = existingFile.sha;
+      } catch (error) {
+        // File doesn't exist yet, which is fine
+        core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
+      }
+      
       // Create or update the file in the versioned folder
       await octokit.rest.repos.createOrUpdateFileContents({
         ...context.repo,
         path: targetPath,
         message: `Backport: Copy ${file.filename} to ${targetPath}`,
         content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
-        branch: branchName
+        branch: branchName,
+        sha: sha || undefined
       });
       
       copied++;
@@ -213,10 +271,55 @@ async function backportFiles(
     }
   }
   
+  // Create stats object
+  const stats: BackportStats = {
+    copied,
+    skipped,
+    errors
+  };
+  
   core.info(`Backport stats - Copied: ${copied}, Skipped: ${skipped}, Errors: ${errors}`);
+  
+  // Return the stats
+  return stats;
 }
 
-async function createBackportPR(
+// Exported for testing
+export async function checkExistingBackportPR(
+  octokit: any,
+  context: any,
+  mainFolder: string,
+  version: string,
+  originalPRNumber: number
+): Promise<any | null> {
+  try {
+    // Search for open PRs that mention the original PR number and have relevant title/labels
+    const { data: openPRs } = await octokit.rest.pulls.list({
+      ...context.repo,
+      state: 'open',
+      sort: 'created',
+      direction: 'desc'
+    });
+
+    // Look for PRs with title mentioning backport to this version and body referencing original PR
+    for (const pr of openPRs) {
+      const matchesTitle = pr.title.includes(`${mainFolder} changes to v${version}`);
+      const referencesOriginalPR = pr.body && pr.body.includes(`Original PR: #${originalPRNumber}`);
+      
+      if (matchesTitle && referencesOriginalPR) {
+        return pr;
+      }
+    }
+    
+    return null;
+  } catch (error: any) {
+    core.warning(`Error checking for existing backport PRs: ${error.message}`);
+    return null;
+  }
+}
+
+// Exported for testing
+export async function createBackportPR(
   octokit: any, 
   context: any, 
   branchName: string, 

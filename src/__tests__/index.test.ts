@@ -1,22 +1,9 @@
-// Simple tests for the Docs Backport Action
+// Tests for the Docs Backport Action
 
 // Import setup to ensure mocks are properly initialized
 import './setup'; 
-
-// Mock the main action module to prevent execution during testing
-jest.mock('../index', () => {
-  // Store the original module
-  const originalModule = jest.requireActual('../index');
-  
-  // Return a function that just logs the call
-  return {
-    ...originalModule,
-    run: jest.fn().mockImplementation(async () => {
-      console.log('Mocked run function called');
-      return Promise.resolve();
-    })
-  };
-});
+// Import the index module
+import * as index from '../index';
 
 describe('Docs Backport Action Tests', () => {
   // Basic test to ensure test environment works
@@ -31,8 +18,81 @@ describe('Docs Backport Action Tests', () => {
     }).not.toThrow();
   });
   
-  // Add more specific tests as the action is implemented
-  // These tests will pass since they're simple placeholder assertions
+  // Test for the checkExistingBackportPR function
+  describe('checkExistingBackportPR', () => {
+    it('returns a PR when one exists', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            list: jest.fn().mockResolvedValue({
+              data: [
+                {
+                  number: 456,
+                  title: 'Backport: vcluster changes to v0.24',
+                  body: 'Original PR: #123'
+                }
+              ]
+            })
+          }
+        }
+      };
+      
+      const mockContext = {
+        repo: {
+          owner: 'loft-sh',
+          repo: 'vcluster-docs'
+        }
+      };
+      
+      const result = await index.checkExistingBackportPR(
+        mockOctokit,
+        mockContext,
+        'vcluster',
+        '0.24',
+        123
+      );
+      
+      expect(result).not.toBeNull();
+      expect(result.number).toBe(456);
+    });
+    
+    it('returns null when no PR exists', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            list: jest.fn().mockResolvedValue({
+              data: [
+                {
+                  number: 456,
+                  title: 'Backport: vcluster changes to v0.25', // Different version
+                  body: 'Original PR: #123'
+                }
+              ]
+            })
+          }
+        }
+      };
+      
+      const mockContext = {
+        repo: {
+          owner: 'loft-sh',
+          repo: 'vcluster-docs'
+        }
+      };
+      
+      const result = await index.checkExistingBackportPR(
+        mockOctokit,
+        mockContext,
+        'vcluster',
+        '0.24',
+        123
+      );
+      
+      expect(result).toBeNull();
+    });
+  });
+  
+  // Original basic tests
   it('processes PR with version labels correctly', () => {
     expect(true).toBe(true);
   });
