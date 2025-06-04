@@ -147,6 +147,9 @@ export async function run(): Promise<void> {
       
       // Only create a PR if we successfully copied at least one file
       if (stats.copied > 0) {
+        // Get original PR title
+        const originalPRTitle = context.payload.pull_request.title;
+        
         // Create a PR
         await createBackportPR(
           octokit, 
@@ -154,7 +157,8 @@ export async function run(): Promise<void> {
           branchName, 
           targetMainFolder, 
           version, 
-          prNumber
+          prNumber,
+          originalPRTitle
         );
       } else {
         core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
@@ -293,21 +297,30 @@ export async function checkExistingBackportPR(
   originalPRNumber: number
 ): Promise<any | null> {
   try {
-    // Search for open PRs that mention the original PR number and have relevant title/labels
-    const { data: openPRs } = await octokit.rest.pulls.list({
-      ...context.repo,
-      state: 'open',
-      sort: 'created',
-      direction: 'desc'
-    });
+    // Search for both open and closed PRs that mention the original PR number
+    const states: Array<'open' | 'closed'> = ['open', 'closed'];
+    
+    for (const state of states) {
+      const { data: prs } = await octokit.rest.pulls.list({
+        ...context.repo,
+        state: state,
+        sort: 'created',
+        direction: 'desc',
+        per_page: 100
+      });
 
-    // Look for PRs with title mentioning backport to this version and body referencing original PR
-    for (const pr of openPRs) {
-      const matchesTitle = pr.title.includes(`${mainFolder} changes to v${version}`);
-      const referencesOriginalPR = pr.body && pr.body.includes(`Original PR: #${originalPRNumber}`);
-      
-      if (matchesTitle && referencesOriginalPR) {
-        return pr;
+      // Look for PRs with the new title format or body referencing original PR
+      for (const pr of prs) {
+        // Check for new title format: [vX.Y] original title (#PR_NUMBER)
+        const matchesNewTitleFormat = pr.title.includes(`[v${version}]`) && pr.title.includes(`(#${originalPRNumber})`);
+        // Also check legacy format for backward compatibility
+        const matchesLegacyTitle = pr.title.includes(`${mainFolder} changes to v${version}`);
+        const referencesOriginalPR = pr.body && pr.body.includes(`Original PR: #${originalPRNumber}`);
+        
+        if ((matchesNewTitleFormat || (matchesLegacyTitle && referencesOriginalPR))) {
+          core.info(`Found existing ${state} backport PR #${pr.number} for ${mainFolder} to v${version} from PR #${originalPRNumber}`);
+          return pr;
+        }
       }
     }
     
@@ -325,12 +338,16 @@ export async function createBackportPR(
   branchName: string, 
   mainFolder: string, 
   version: string, 
-  originalPRNumber: number
+  originalPRNumber: number,
+  originalPRTitle: string
 ): Promise<void> {
+  // Create PR title in the format: [vX.Y] original title (#original_pr_number)
+  const prTitle = `[v${version}] ${originalPRTitle} (#${originalPRNumber})`;
+  
   // Create a PR
   const { data: pr } = await octokit.rest.pulls.create({
     ...context.repo,
-    title: `Backport: ${mainFolder} changes to v${version}`,
+    title: prTitle,
     body: `This PR backports changes from ${mainFolder} to version v${version}.\n\nOriginal PR: #${originalPRNumber}`,
     head: branchName,
     base: context.payload.repository.default_branch

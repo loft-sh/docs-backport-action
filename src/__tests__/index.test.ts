@@ -20,15 +20,53 @@ describe('Docs Backport Action Tests', () => {
   
   // Test for the checkExistingBackportPR function
   describe('checkExistingBackportPR', () => {
-    it('returns a PR when one exists', async () => {
+    it('returns a PR when one exists with legacy format', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            list: jest.fn()
+              .mockResolvedValueOnce({ data: [] }) // No open PRs
+              .mockResolvedValueOnce({
+                data: [
+                  {
+                    number: 456,
+                    title: 'Backport: vcluster changes to v0.24',
+                    body: 'Original PR: #123'
+                  }
+                ]
+              })
+          }
+        }
+      };
+      
+      const mockContext = {
+        repo: {
+          owner: 'loft-sh',
+          repo: 'vcluster-docs'
+        }
+      };
+      
+      const result = await index.checkExistingBackportPR(
+        mockOctokit,
+        mockContext,
+        'vcluster',
+        '0.24',
+        123
+      );
+      
+      expect(result).not.toBeNull();
+      expect(result.number).toBe(456);
+    });
+
+    it('returns a PR when one exists with new format', async () => {
       const mockOctokit = {
         rest: {
           pulls: {
             list: jest.fn().mockResolvedValue({
               data: [
                 {
-                  number: 456,
-                  title: 'Backport: vcluster changes to v0.24',
+                  number: 789,
+                  title: '[v0.24] Fix some issue (#123)',
                   body: 'Original PR: #123'
                 }
               ]
@@ -53,22 +91,55 @@ describe('Docs Backport Action Tests', () => {
       );
       
       expect(result).not.toBeNull();
+      expect(result.number).toBe(789);
+    });
+
+    it('checks both open and closed PRs', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            list: jest.fn()
+              .mockResolvedValueOnce({ data: [] }) // No open PRs
+              .mockResolvedValueOnce({
+                data: [
+                  {
+                    number: 456,
+                    title: '[v0.24] Some title (#123)',
+                    body: 'Original PR: #123',
+                    state: 'closed'
+                  }
+                ]
+              })
+          }
+        }
+      };
+      
+      const mockContext = {
+        repo: {
+          owner: 'loft-sh',
+          repo: 'vcluster-docs'
+        }
+      };
+      
+      const result = await index.checkExistingBackportPR(
+        mockOctokit,
+        mockContext,
+        'vcluster',
+        '0.24',
+        123
+      );
+      
+      expect(result).not.toBeNull();
       expect(result.number).toBe(456);
+      expect(mockOctokit.rest.pulls.list).toHaveBeenCalledTimes(2);
     });
     
     it('returns null when no PR exists', async () => {
       const mockOctokit = {
         rest: {
           pulls: {
-            list: jest.fn().mockResolvedValue({
-              data: [
-                {
-                  number: 456,
-                  title: 'Backport: vcluster changes to v0.25', // Different version
-                  body: 'Original PR: #123'
-                }
-              ]
-            })
+            list: jest.fn()
+              .mockResolvedValue({ data: [] })
           }
         }
       };
