@@ -21,8 +21,8 @@ jobs:
         id: extract_major
         run: |
           TAG="${{ steps.get_tag.outputs.TAG }}"
-          MAJOR="v${TAG#v*.*.*}"
-          MAJOR="v${MAJOR%%.*}"
+          # Extract just the major version number (e.g., v1.2.3 -> v1)
+          MAJOR="${TAG%%.*}"
           echo "MAJOR_VERSION=${MAJOR}" >> $GITHUB_OUTPUT
           
       - name: Update or create major version tag
