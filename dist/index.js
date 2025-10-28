@@ -29982,9 +29982,11 @@ async function run() {
         const merged = context.payload.pull_request.merged || false;
         const labels = context.payload.pull_request.labels || [];
         // For label events, only proceed if the added label is a backport label
+        let versionLabels = [];
         if (context.payload.action === 'labeled') {
             const addedLabel = context.payload.label?.name || '';
-            if (!addedLabel.match(VERSION_LABEL_REGEX)) {
+            const match = addedLabel.match(VERSION_LABEL_REGEX);
+            if (!match) {
                 core.info(`Added label "${addedLabel}" is not a backport label, skipping`);
                 return;
             }
@@ -29993,19 +29995,24 @@ async function run() {
                 core.info('PR is labeled but not merged yet, skipping backport until merge');
                 return;
             }
+            // For labeled events, only process the newly added label to avoid duplicates
+            versionLabels = [match[1]];
+            core.info(`Processing only the newly added label: backport-v${match[1]}`);
         }
-        // If not merged and not a label event, skip
-        if (!merged && context.payload.action !== 'labeled') {
-            core.info('PR not merged and not a label event, skipping');
-            return;
+        else {
+            // If not merged and not a label event, skip
+            if (!merged) {
+                core.info('PR not merged and not a label event, skipping');
+                return;
+            }
+            // Extract all version labels for closed/merged events
+            versionLabels = labels
+                .map((label) => {
+                const match = label.name.match(VERSION_LABEL_REGEX);
+                return match ? match[1] : null;
+            })
+                .filter((v) => v !== null);
         }
-        // Extract version labels
-        const versionLabels = labels
-            .map((label) => {
-            const match = label.name.match(VERSION_LABEL_REGEX);
-            return match ? match[1] : null;
-        })
-            .filter((v) => v !== null);
         if (versionLabels.length === 0) {
             core.info('No version labels found, skipping backport');
             return;
