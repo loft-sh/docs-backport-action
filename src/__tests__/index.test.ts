@@ -1,9 +1,12 @@
 // Tests for the Docs Backport Action
 
 // Import setup to ensure mocks are properly initialized
-import './setup'; 
+import './setup';
 // Import the index module
 import * as index from '../index';
+
+// Export backportFiles for testing - we need to test it directly
+// Since it's not exported, we'll test via the run() function behavior
 
 describe('Docs Backport Action Tests', () => {
   // Basic test to ensure test environment works
@@ -289,7 +292,126 @@ describe('Docs Backport Action Tests', () => {
 
       expect(context.payload.pull_request.merged).toBe(false);
     });
+  });
 
+  describe('backportFiles SHA conflict handling', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('logs error when SHA conflict retry also fails', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 })
+              .mockRejectedValueOnce(new Error('network error')), // retry getContent fails
+            createOrUpdateFileContents: jest.fn()
+              .mockRejectedValueOnce(new Error('is at abc but expected def'))
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.errors).toBe(1);
+      expect(stats.copied).toBe(0);
+    });
+
+    it('copies file when no conflict', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.errors).toBe(0);
+    });
+
+    it('retries with correct SHA on conflict (message pattern)', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: { sha: 'conflict-sha' } }),
+            createOrUpdateFileContents: jest.fn()
+              .mockRejectedValueOnce(new Error('is at x but expected y'))
+              .mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.errors).toBe(0);
+    });
+
+    it('retries on HTTP 409 status', async () => {
+      const error409 = new Error('Conflict') as any;
+      error409.status = 409;
+
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: { sha: 'conflict-sha' } }),
+            createOrUpdateFileContents: jest.fn()
+              .mockRejectedValueOnce(error409)
+              .mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.errors).toBe(0);
+    });
+  });
+
+  describe('Label Processing Logic - Regression Tests', () => {
     it('REGRESSION TEST: multiple labels should not create duplicate PRs', () => {
       // This test verifies the fix for the duplicate PR bug
       // Scenario: PR #123 is merged with labels backport-v0.22 and backport-v0.23

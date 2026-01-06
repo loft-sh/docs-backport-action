@@ -29954,6 +29954,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.run = run;
+exports.backportFiles = backportFiles;
 exports.checkExistingBackportPR = checkExistingBackportPR;
 exports.createBackportPR = createBackportPR;
 const core = __importStar(__nccwpck_require__(7484));
@@ -30100,6 +30101,7 @@ async function createBranchForBackport(octokit, context, branchName) {
     });
     core.info(`Created branch ${branchName}`);
 }
+// Exported for testing
 async function backportFiles(octokit, context, sourceFolder, versionedFolder, files, branchName) {
     // Track stats for reporting
     let copied = 0;
@@ -30140,14 +30142,42 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
                 core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
             }
             // Create or update the file in the versioned folder
-            await octokit.rest.repos.createOrUpdateFileContents({
-                ...context.repo,
-                path: targetPath,
-                message: `Backport: Copy ${file.filename} to ${targetPath}`,
-                content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
-                branch: branchName,
-                sha: sha || undefined
-            });
+            try {
+                await octokit.rest.repos.createOrUpdateFileContents({
+                    ...context.repo,
+                    path: targetPath,
+                    message: `Backport: Copy ${file.filename} to ${targetPath}`,
+                    content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+                    branch: branchName,
+                    sha: sha || undefined
+                });
+            }
+            catch (createError) {
+                // Check if this is a SHA conflict (file was created between check and write)
+                const isShaConflict = createError.status === 409 || createError.message?.includes('but expected');
+                if (isShaConflict) {
+                    core.info(`SHA conflict detected for ${targetPath}, retrying with current SHA...`);
+                    // Re-fetch the current SHA
+                    const { data: conflictFile } = await octokit.rest.repos.getContent({
+                        ...context.repo,
+                        path: targetPath,
+                        ref: branchName
+                    });
+                    // Retry with the correct SHA
+                    await octokit.rest.repos.createOrUpdateFileContents({
+                        ...context.repo,
+                        path: targetPath,
+                        message: `Backport: Copy ${file.filename} to ${targetPath}`,
+                        content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+                        branch: branchName,
+                        sha: conflictFile.sha
+                    });
+                    core.info(`Retry successful for ${targetPath}`);
+                }
+                else {
+                    throw createError;
+                }
+            }
             copied++;
             core.info(`Backported ${file.filename} to ${targetPath}`);
         }
