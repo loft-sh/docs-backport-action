@@ -213,7 +213,8 @@ interface BackportStats {
   errors: number;
 }
 
-async function backportFiles(
+// Exported for testing
+export async function backportFiles(
   octokit: any, 
   context: any, 
   sourceFolder: string, 
@@ -266,15 +267,43 @@ async function backportFiles(
       }
       
       // Create or update the file in the versioned folder
-      await octokit.rest.repos.createOrUpdateFileContents({
-        ...context.repo,
-        path: targetPath,
-        message: `Backport: Copy ${file.filename} to ${targetPath}`,
-        content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
-        branch: branchName,
-        sha: sha || undefined
-      });
-      
+      try {
+        await octokit.rest.repos.createOrUpdateFileContents({
+          ...context.repo,
+          path: targetPath,
+          message: `Backport: Copy ${file.filename} to ${targetPath}`,
+          content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+          branch: branchName,
+          sha: sha || undefined
+        });
+      } catch (createError: any) {
+        // Check if this is a SHA conflict (file was created between check and write)
+        const isShaConflict = createError.status === 409 || createError.message?.includes('but expected');
+        if (isShaConflict) {
+          core.info(`SHA conflict detected for ${targetPath}, retrying with current SHA...`);
+
+          // Re-fetch the current SHA
+          const { data: conflictFile } = await octokit.rest.repos.getContent({
+            ...context.repo,
+            path: targetPath,
+            ref: branchName
+          });
+
+          // Retry with the correct SHA
+          await octokit.rest.repos.createOrUpdateFileContents({
+            ...context.repo,
+            path: targetPath,
+            message: `Backport: Copy ${file.filename} to ${targetPath}`,
+            content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+            branch: branchName,
+            sha: conflictFile.sha
+          });
+          core.info(`Retry successful for ${targetPath}`);
+        } else {
+          throw createError;
+        }
+      }
+
       copied++;
       core.info(`Backported ${file.filename} to ${targetPath}`);
     } catch (error: any) {
