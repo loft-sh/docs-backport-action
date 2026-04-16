@@ -411,6 +411,253 @@ describe('Docs Backport Action Tests', () => {
     });
   });
 
+  describe('deleteVersionedFile', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('deletes file when it exists in versioned folder', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockResolvedValueOnce({ data: { sha: 'existing-sha' } }),
+            deleteFile: jest.fn().mockResolvedValueOnce({})
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      const result = await index.deleteVersionedFile(
+        mockOctokit, mockContext, 'vcluster_versioned_docs/version-0.27.0/test.mdx', 'backport/branch'
+      );
+
+      expect(result).toBe('deleted');
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalledWith(
+        expect.objectContaining({ sha: 'existing-sha', branch: 'backport/branch' })
+      );
+    });
+
+    it('returns absent when file does not exist (404)', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockRejectedValueOnce({ status: 404 }),
+            deleteFile: jest.fn()
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      const result = await index.deleteVersionedFile(
+        mockOctokit, mockContext, 'vcluster_versioned_docs/version-0.27.0/test.mdx', 'backport/branch'
+      );
+
+      expect(result).toBe('absent');
+      expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+    });
+
+    it('retries delete on SHA conflict', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { sha: 'old-sha' } })
+              .mockResolvedValueOnce({ data: { sha: 'new-sha' } }),
+            deleteFile: jest.fn()
+              .mockRejectedValueOnce(new Error('is at abc but expected def'))
+              .mockResolvedValueOnce({})
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      const result = await index.deleteVersionedFile(
+        mockOctokit, mockContext, 'vcluster_versioned_docs/version-0.27.0/test.mdx', 'backport/branch'
+      );
+
+      expect(result).toBe('deleted');
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalledTimes(2);
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sha: 'new-sha' })
+      );
+    });
+
+    it('retries delete on HTTP 409', async () => {
+      const error409 = new Error('Conflict') as any;
+      error409.status = 409;
+
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { sha: 'old-sha' } })
+              .mockResolvedValueOnce({ data: { sha: 'new-sha' } }),
+            deleteFile: jest.fn()
+              .mockRejectedValueOnce(error409)
+              .mockResolvedValueOnce({})
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      const result = await index.deleteVersionedFile(
+        mockOctokit, mockContext, 'vcluster_versioned_docs/version-0.27.0/test.mdx', 'backport/branch'
+      );
+
+      expect(result).toBe('deleted');
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws non-conflict errors', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockResolvedValueOnce({ data: { sha: 'sha' } }),
+            deleteFile: jest.fn().mockRejectedValueOnce(new Error('server error'))
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      await expect(index.deleteVersionedFile(
+        mockOctokit, mockContext, 'path/file.mdx', 'branch'
+      )).rejects.toThrow('server error');
+    });
+  });
+
+  describe('backportFiles with removed files', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('deletes removed file from versioned folder', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { sha: 'target-sha' } }),
+            deleteFile: jest.fn().mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/removed.mdx', status: 'removed' }],
+        'backport/branch'
+      );
+
+      expect(stats.deleted).toBe(1);
+      expect(stats.copied).toBe(0);
+      expect(stats.skipped).toBe(0);
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalled();
+    });
+
+    it('skips removed file when already absent from versioned folder', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockRejectedValueOnce({ status: 404 }),
+            deleteFile: jest.fn()
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/gone.mdx', status: 'removed' }],
+        'backport/branch'
+      );
+
+      expect(stats.deleted).toBe(0);
+      expect(stats.skipped).toBe(1);
+      expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('backportFiles with renamed files', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('copies new path and deletes old path for renamed file', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              // 1st call: get source content for the new filename
+              .mockResolvedValueOnce({ data: { content: Buffer.from('new content').toString('base64'), sha: 'src' } })
+              // 2nd call: check if new target exists (404 = doesn't exist yet)
+              .mockRejectedValueOnce({ status: 404 })
+              // 3rd call: check if old target exists for deletion
+              .mockResolvedValueOnce({ data: { sha: 'old-target-sha' } }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({}),
+            deleteFile: jest.fn().mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{
+          filename: 'vcluster/new-name.mdx',
+          previous_filename: 'vcluster/old-name.mdx',
+          status: 'renamed'
+        }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.deleted).toBe(1);
+      expect(stats.errors).toBe(0);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.27.0/old-name.mdx' })
+      );
+    });
+
+    it('copies new path even when old path already absent', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('content').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 }) // new target doesn't exist
+              .mockRejectedValueOnce({ status: 404 }), // old target also doesn't exist
+            createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({}),
+            deleteFile: jest.fn()
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{
+          filename: 'vcluster/new-name.mdx',
+          previous_filename: 'vcluster/old-name.mdx',
+          status: 'renamed'
+        }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.deleted).toBe(0);
+      expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Label Processing Logic - Regression Tests', () => {
     it('REGRESSION TEST: multiple labels should not create duplicate PRs', () => {
       // This test verifies the fix for the duplicate PR bug
