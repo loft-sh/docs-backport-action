@@ -1,6 +1,5 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import * as path from 'path';
 
 // Define main folders and their versioned counterparts
 const FOLDER_MAPPING: Record<string, string> = {
@@ -153,8 +152,8 @@ export async function run(): Promise<void> {
         branchName
       );
       
-      // Only create a PR if we successfully copied at least one file
-      if (stats.copied > 0) {
+      // Only create a PR if we successfully copied or deleted at least one file
+      if (stats.copied > 0 || stats.deleted > 0) {
         // Get original PR title
         const originalPRTitle = context.payload.pull_request.title;
         
@@ -209,8 +208,67 @@ async function createBranchForBackport(
 // Interface for backport statistics
 interface BackportStats {
   copied: number;
+  deleted: number;
   skipped: number;
   errors: number;
+}
+
+// Delete a file from the versioned folder. Returns 'deleted' or 'absent'.
+export async function deleteVersionedFile(
+  octokit: any,
+  context: any,
+  targetPath: string,
+  branchName: string
+): Promise<'deleted' | 'absent'> {
+  // Get the file's current SHA
+  let sha: string;
+  try {
+    const { data: existingFile } = await octokit.rest.repos.getContent({
+      ...context.repo,
+      path: targetPath,
+      ref: branchName
+    });
+    sha = existingFile.sha;
+  } catch (error: any) {
+    if (error.status === 404) {
+      core.info(`File already absent in versioned folder: ${targetPath}`);
+      return 'absent';
+    }
+    throw error;
+  }
+
+  // Delete the file, with SHA conflict retry
+  try {
+    await octokit.rest.repos.deleteFile({
+      ...context.repo,
+      path: targetPath,
+      message: `Backport: Delete ${targetPath} (removed in source)`,
+      sha,
+      branch: branchName
+    });
+  } catch (deleteError: any) {
+    const isShaConflict = deleteError.status === 409 || deleteError.message?.includes('but expected');
+    if (isShaConflict) {
+      core.info(`SHA conflict on delete for ${targetPath}, retrying...`);
+      const { data: conflictFile } = await octokit.rest.repos.getContent({
+        ...context.repo,
+        path: targetPath,
+        ref: branchName
+      });
+      await octokit.rest.repos.deleteFile({
+        ...context.repo,
+        path: targetPath,
+        message: `Backport: Delete ${targetPath} (removed in source)`,
+        sha: conflictFile.sha,
+        branch: branchName
+      });
+    } else {
+      throw deleteError;
+    }
+  }
+
+  core.info(`Deleted ${targetPath}`);
+  return 'deleted';
 }
 
 // Exported for testing
@@ -224,21 +282,27 @@ export async function backportFiles(
 ): Promise<BackportStats> {
   // Track stats for reporting
   let copied = 0;
+  let deleted = 0;
   let skipped = 0;
   let errors = 0;
-  
+
   for (const file of files) {
     try {
       // Extract the relative path within the source folder
       const relativePath = file.filename.substring(sourceFolder.length + 1);
-      
-      // Skip if file was deleted in the PR
+
+      // Delete file from versioned folder if it was removed in the PR
       if (file.status === 'removed') {
-        core.info(`Skipping deleted file: ${file.filename}`);
-        skipped++;
+        const targetPath = `${versionedFolder}/${relativePath}`;
+        const result = await deleteVersionedFile(octokit, context, targetPath, branchName);
+        if (result === 'deleted') {
+          deleted++;
+        } else {
+          skipped++;
+        }
         continue;
       }
-      
+
       // Construct the target path in the versioned folder
       // For your structure, we need to copy to version-vX.Y.Z/[original path]
       const targetPath = `${versionedFolder}/${relativePath}`;
@@ -306,20 +370,34 @@ export async function backportFiles(
 
       copied++;
       core.info(`Backported ${file.filename} to ${targetPath}`);
+
+      // For renamed files, also delete the old path from the versioned folder
+      if (file.status === 'renamed' && file.previous_filename) {
+        const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
+        const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
+        const result = await deleteVersionedFile(octokit, context, oldTargetPath, branchName);
+        if (result === 'deleted') {
+          deleted++;
+          core.info(`Deleted old path ${oldTargetPath} after rename`);
+        } else {
+          core.info(`Old path already absent after rename: ${oldTargetPath}`);
+        }
+      }
     } catch (error: any) {
       errors++;
       core.warning(`Error backporting file ${file.filename}: ${error.message}`);
     }
   }
-  
+
   // Create stats object
   const stats: BackportStats = {
     copied,
+    deleted,
     skipped,
     errors
   };
-  
-  core.info(`Backport stats - Copied: ${copied}, Skipped: ${skipped}, Errors: ${errors}`);
+
+  core.info(`Backport stats - Copied: ${copied}, Deleted: ${deleted}, Skipped: ${skipped}, Errors: ${errors}`);
   
   // Return the stats
   return stats;
