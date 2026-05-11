@@ -340,7 +340,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/test.mdx', status: 'added' }],
@@ -349,6 +349,39 @@ describe('Docs Backport Action Tests', () => {
 
       expect(stats.copied).toBe(1);
       expect(stats.errors).toBe(0);
+    });
+
+    it('reads source content from merge_commit_sha, not head.sha', async () => {
+      // Regression for DEVOPS-855: backports must reflect the post-merge state
+      // (3-way merge reconciliation on main) rather than the PR branch tip.
+      // Reproduces vcluster-docs PR #1963 scenario where head.sha captured a
+      // deletion that the merge silently restored.
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
+              .mockRejectedValueOnce({ status: 404 }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({})
+          }
+        }
+      };
+
+      await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'head-sha' }, merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(mockOctokit.rest.repos.getContent).toHaveBeenNthCalledWith(1,
+        expect.objectContaining({ path: 'vcluster/test.mdx', ref: 'merge-sha' })
+      );
+      expect(mockOctokit.rest.repos.getContent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster/test.mdx', ref: 'head-sha' })
+      );
     });
 
     it('retries with correct SHA on conflict (message pattern)', async () => {
