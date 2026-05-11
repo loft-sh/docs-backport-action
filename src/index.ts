@@ -309,11 +309,15 @@ export async function backportFiles(
       
       core.info(`Backporting ${file.filename} to ${targetPath}`);
       
-      // Get the file content from the PR's head branch
+      // Get the file content from the merge commit on the base branch.
+      // Using head.sha would capture the pre-merge state and miss changes
+      // that the 3-way merge reconciliation applied on main (e.g. deletions
+      // silently restored, paths altered). merge_commit_sha is populated for
+      // merged PRs across squash, merge-commit, and rebase strategies.
       const { data: content } = await octokit.rest.repos.getContent({
         ...context.repo,
         path: file.filename,
-        ref: context.payload.pull_request.head.sha
+        ref: context.payload.pull_request.merge_commit_sha
       });
       
       // Check if the target file already exists to get its SHA
