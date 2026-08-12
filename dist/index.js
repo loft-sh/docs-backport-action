@@ -29954,6 +29954,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.run = run;
+exports.listChangedFiles = listChangedFiles;
 exports.deleteVersionedFile = deleteVersionedFile;
 exports.backportFiles = backportFiles;
 exports.checkExistingBackportPR = checkExistingBackportPR;
@@ -29966,7 +29967,10 @@ const FOLDER_MAPPING = {
     'vcluster': 'vcluster_versioned_docs'
 };
 // Regular expression to match version labels (e.g., backport-v0.22, backport-v4.2)
-const VERSION_LABEL_REGEX = /^backport-v([\d\.]+)$/;
+const VERSION_LABEL_REGEX = /^backport-v([\d.]+)$/;
+// GitHub's pulls.listFiles endpoint returns 30 files per page by default and
+// serves at most 100 per page.
+const FILES_PER_PAGE = 100;
 // Main function, exported for testing
 async function run() {
     try {
@@ -30020,10 +30024,8 @@ async function run() {
             return;
         }
         // Get changed files from the PR
-        const { data: files } = await octokit.rest.pulls.listFiles({
-            ...context.repo,
-            pull_number: prNumber
-        });
+        const files = await listChangedFiles(octokit, context, prNumber);
+        core.info(`PR #${prNumber} has ${files.length} changed files`);
         // Group files by main folder
         const filesByFolder = {};
         for (const mainFolder of Object.keys(FOLDER_MAPPING)) {
@@ -30082,6 +30084,19 @@ async function run() {
     catch (error) {
         core.setFailed(`Action failed: ${error.message}`);
     }
+}
+// Fetch every changed file in the PR, following pagination.
+// An unpaginated listFiles call returns only the first 30 files, and the files
+// past that boundary vanish before the backport loop starts: they are never
+// copied, never logged as skipped, and never counted as errors, so the backport
+// PR looks complete while quietly carrying stale or missing pages.
+// Exported for testing
+async function listChangedFiles(octokit, context, prNumber) {
+    return octokit.paginate(octokit.rest.pulls.listFiles, {
+        ...context.repo,
+        pull_number: prNumber,
+        per_page: FILES_PER_PAGE
+    });
 }
 async function createBranchForBackport(octokit, context, branchName) {
     // Get the default branch

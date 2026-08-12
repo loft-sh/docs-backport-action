@@ -4,7 +4,6 @@
 import './setup';
 // Import the index module
 import * as index from '../index';
-
 // Export backportFiles for testing - we need to test it directly
 // Since it's not exported, we'll test via the run() function behavior
 
@@ -688,6 +687,90 @@ describe('Docs Backport Action Tests', () => {
       expect(stats.copied).toBe(1);
       expect(stats.deleted).toBe(0);
       expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listChangedFiles', () => {
+    const mockContext = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' } };
+
+    // Build a list of changed files under the vcluster/ prefix
+    const makeFiles = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        filename: `vcluster/doc-${i}.mdx`,
+        status: 'modified'
+      }));
+
+    it('uses Octokit pagination for the complete changed-file list', async () => {
+      const listFiles = jest.fn();
+      const paginate = jest.fn().mockResolvedValue(makeFiles(136));
+      const mockOctokit = { paginate, rest: { pulls: { listFiles } } };
+
+      const files = await index.listChangedFiles(mockOctokit, mockContext, 2475);
+
+      expect(files).toHaveLength(136);
+      expect(paginate).toHaveBeenCalledWith(
+        listFiles,
+        expect.objectContaining({
+          owner: 'loft-sh',
+          repo: 'vcluster-docs',
+          pull_number: 2475,
+          per_page: 100
+        })
+      );
+    });
+
+    it('does not impose a client-side file or page limit', async () => {
+      const listFiles = jest.fn();
+      const paginate = jest.fn().mockResolvedValue(makeFiles(3500));
+      const mockOctokit = { paginate, rest: { pulls: { listFiles } } };
+
+      const files = await index.listChangedFiles(mockOctokit, mockContext, 2475);
+
+      expect(files).toHaveLength(3500);
+    });
+
+    it('REGRESSION TEST: backports every file of a PR with more than 30 changed files', async () => {
+      // Reproduces loft-sh/vcluster-docs#2475: 36 changed files, of which the
+      // last 6 fell past the unpaginated first page and were silently dropped
+      // from the backport PR, four of them left stale and two never created.
+      const listFiles = jest.fn();
+      const paginate = jest.fn().mockResolvedValue(makeFiles(36));
+      const mockOctokit = {
+        paginate,
+        rest: {
+          pulls: { listFiles },
+          repos: {
+            getContent: jest.fn().mockImplementation(({ path }: any) =>
+              path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 }) // target file not there yet
+                : Promise.resolve({
+                    data: { content: Buffer.from('content').toString('base64'), sha: 'src' }
+                  })
+            ),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const files = await index.listChangedFiles(mockOctokit, mockContext, 2475);
+      expect(files).toHaveLength(36);
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { ...mockContext, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.36.0',
+        files,
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(36);
+      expect(stats.errors).toBe(0);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(36);
+      // The files past the first page reach the versioned folder too
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.36.0/doc-35.mdx' })
+      );
     });
   });
 
