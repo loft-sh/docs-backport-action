@@ -8,7 +8,11 @@ const FOLDER_MAPPING: Record<string, string> = {
 };
 
 // Regular expression to match version labels (e.g., backport-v0.22, backport-v4.2)
-const VERSION_LABEL_REGEX = /^backport-v([\d\.]+)$/;
+const VERSION_LABEL_REGEX = /^backport-v([\d.]+)$/;
+
+// GitHub's pulls.listFiles endpoint returns 30 files per page by default and
+// serves at most 100 per page.
+const FILES_PER_PAGE = 100;
 
 // Type for a GitHub label
 interface GitHubLabel {
@@ -80,11 +84,9 @@ export async function run(): Promise<void> {
     }
     
     // Get changed files from the PR
-    const { data: files } = await octokit.rest.pulls.listFiles({
-      ...context.repo,
-      pull_number: prNumber
-    });
-    
+    const files = await listChangedFiles(octokit, context, prNumber);
+    core.info(`PR #${prNumber} has ${files.length} changed files`);
+
     // Group files by main folder
     const filesByFolder: Record<string, typeof files> = {};
     for (const mainFolder of Object.keys(FOLDER_MAPPING)) {
@@ -177,9 +179,30 @@ export async function run(): Promise<void> {
   }
 }
 
+// Fetch every changed file in the PR, following pagination.
+// An unpaginated listFiles call returns only the first 30 files, and the files
+// past that boundary vanish before the backport loop starts: they are never
+// copied, never logged as skipped, and never counted as errors, so the backport
+// PR looks complete while quietly carrying stale or missing pages.
+// Exported for testing
+export async function listChangedFiles(
+  octokit: any,
+  context: any,
+  prNumber: number
+): Promise<any[]> {
+  return octokit.paginate(
+    octokit.rest.pulls.listFiles,
+    {
+      ...context.repo,
+      pull_number: prNumber,
+      per_page: FILES_PER_PAGE
+    }
+  );
+}
+
 async function createBranchForBackport(
-  octokit: any, 
-  context: any, 
+  octokit: any,
+  context: any,
   branchName: string
 ): Promise<void> {
   // Get the default branch
