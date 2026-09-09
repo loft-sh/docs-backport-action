@@ -329,6 +329,7 @@ describe('Docs Backport Action Tests', () => {
       const mockOctokit = {
         rest: {
           repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 }),
@@ -358,6 +359,7 @@ describe('Docs Backport Action Tests', () => {
       const mockOctokit = {
         rest: {
           repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 }),
@@ -740,6 +742,7 @@ describe('Docs Backport Action Tests', () => {
         rest: {
           pulls: { listFiles },
           repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn().mockImplementation(({ path }: any) =>
               path.startsWith('vcluster_versioned_docs/')
                 ? Promise.reject({ status: 404 }) // target file not there yet
@@ -816,6 +819,230 @@ describe('Docs Backport Action Tests', () => {
       // Verify we have the right structure
       expect(match).not.toBeNull();
       expect(labeledEventForV023.payload.pull_request.labels).toHaveLength(2);
+    });
+  });
+
+  describe('backportFiles patch-merge (drift protection)', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    // Regression for the vcluster-docs #2766/#2767 incident: a wholesale
+    // overwrite of the versioned file with main's current HEAD dragged in
+    // unrelated content (a newer feature section, a reverted import-path fix)
+    // that the source PR never touched. These tests exercise the patch-merge
+    // path directly against the real `diff` library, not a stub.
+    const base = 'line one\nline two\nline three\n';
+    const afterPRChange = 'line one\nline TWO CHANGED\nline three\n';
+
+    it('merges the PR\'s own change onto a versioned file with independent later history', async () => {
+      // The versioned copy already diverged from `base` in a region the PR
+      // never touched (an extra trailing section from later, unrelated work).
+      // A wholesale copy of `afterPRChange` would silently discard that
+      // section; the patch merge must preserve it.
+      const versionedWithOwnHistory = 'line one\nline two\nline three\nversion-only section\n';
+
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/test.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(afterPRChange).toString('base64') } });
+              }
+              if (path === 'vcluster/test.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(base).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/test.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(versionedWithOwnHistory).toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+
+      const writtenContent = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
+      const writtenText = Buffer.from(writtenContent, 'base64').toString('utf-8');
+
+      expect(writtenText).toContain('line TWO CHANGED'); // the PR's own change landed
+      expect(writtenText).toContain('version-only section'); // independent history survived
+    });
+
+    it('skips the file and reports a conflict when the versioned copy diverged in the same spot the PR changed', async () => {
+      // The versioned file already has a different edit to the exact line
+      // the PR changes, so there is no context-safe way to apply the patch.
+      const versionedWithConflictingEdit = 'line one\nline TWO edited differently in this version\nline three\n';
+
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/test.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(afterPRChange).toString('base64') } });
+              }
+              if (path === 'vcluster/test.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(base).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/test.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(versionedWithConflictingEdit).toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(0);
+      expect(stats.conflicts).toBe(1);
+      expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/test.mdx']);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+    });
+
+    it('falls back to a direct copy for an added file with no prior state to protect', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn()
+              .mockResolvedValueOnce({ data: { content: Buffer.from('brand new content').toString('base64') } })
+              .mockRejectedValueOnce({ status: 404 }), // no existing target file
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/new-page.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      // getCommit was called once to resolve the shared pre-merge base, not once per file
+      expect(mockOctokit.rest.repos.getCommit).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('postConflictComment', () => {
+    it('posts a comment listing every conflicting file', async () => {
+      const mockOctokit = {
+        rest: {
+          issues: {
+            createComment: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+      const mockContext = { repo: { owner: 'test', repo: 'test' } };
+
+      await index.postConflictComment(
+        mockOctokit,
+        mockContext,
+        123,
+        'platform',
+        '4.11',
+        ['platform_versioned_docs/version-4.11.0/reference/platform-annotations.mdx']
+      );
+
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issue_number: 123,
+          body: expect.stringContaining('platform-annotations.mdx')
+        })
+      );
+    });
+  });
+
+  describe('createBackportPR conflict reporting', () => {
+    it('appends a manual-review section listing conflict files', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: { create: jest.fn().mockResolvedValue({ data: { number: 999 } }) },
+          issues: { addLabels: jest.fn().mockResolvedValue({}) }
+        }
+      };
+      const mockContext = {
+        repo: { owner: 'test', repo: 'test' },
+        payload: { repository: { default_branch: 'main' } }
+      };
+
+      await index.createBackportPR(
+        mockOctokit,
+        mockContext,
+        'backport/branch',
+        'platform',
+        '4.11',
+        123,
+        'Some PR title',
+        ['platform_versioned_docs/version-4.11.0/reference/platform-annotations.mdx']
+      );
+
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.stringContaining('Manual review needed')
+        })
+      );
+    });
+
+    it('omits the manual-review section when there are no conflicts', async () => {
+      const mockOctokit = {
+        rest: {
+          pulls: { create: jest.fn().mockResolvedValue({ data: { number: 999 } }) },
+          issues: { addLabels: jest.fn().mockResolvedValue({}) }
+        }
+      };
+      const mockContext = {
+        repo: { owner: 'test', repo: 'test' },
+        payload: { repository: { default_branch: 'main' } }
+      };
+
+      await index.createBackportPR(
+        mockOctokit,
+        mockContext,
+        'backport/branch',
+        'platform',
+        '4.11',
+        123,
+        'Some PR title'
+      );
+
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.not.stringContaining('Manual review needed')
+        })
+      );
     });
   });
 });

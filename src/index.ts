@@ -1,5 +1,6 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
+import { createPatch, applyPatch } from 'diff';
 
 // Define main folders and their versioned counterparts
 const FOLDER_MAPPING: Record<string, string> = {
@@ -158,19 +159,27 @@ export async function run(): Promise<void> {
       if (stats.copied > 0 || stats.deleted > 0) {
         // Get original PR title
         const originalPRTitle = context.payload.pull_request.title;
-        
+
         // Create a PR
         await createBackportPR(
-          octokit, 
-          context, 
-          branchName, 
-          targetMainFolder, 
-          version, 
+          octokit,
+          context,
+          branchName,
+          targetMainFolder,
+          version,
           prNumber,
-          originalPRTitle
+          originalPRTitle,
+          stats.conflictFiles
         );
       } else {
         core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
+      }
+
+      // Conflicts need a human regardless of whether a backport PR got
+      // created (an all-conflicts backport has nothing to open a PR with,
+      // since nothing was actually committed to the branch).
+      if (stats.conflictFiles.length > 0) {
+        await postConflictComment(octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles);
       }
     }
     
@@ -234,6 +243,21 @@ interface BackportStats {
   deleted: number;
   skipped: number;
   errors: number;
+  conflicts: number;
+  conflictFiles: string[];
+}
+
+// Decode a Contents API response body to UTF-8 text, regardless of whether
+// Octokit handed back a base64 string or an already-decoded buffer/array.
+function decodeContent(content: any): string {
+  if (typeof content === 'string') {
+    return Buffer.from(content, 'base64').toString('utf-8');
+  }
+  return Buffer.from(content).toString('utf-8');
+}
+
+function encodeContent(text: string): string {
+  return Buffer.from(text, 'utf-8').toString('base64');
 }
 
 // Delete a file from the versioned folder. Returns 'deleted' or 'absent'.
@@ -294,13 +318,44 @@ export async function deleteVersionedFile(
   return 'deleted';
 }
 
+// Fetch the SHA of the commit immediately before this PR's changes landed on
+// the base branch. For both merge commits and squash commits, parents[0] is
+// the base branch tip at merge time, so the file content at this SHA is the
+// PR's own diff baseline: unaffected by whatever else has merged to the
+// default branch since (which is exactly the drift that leaks into every
+// open backport when we instead copy today's HEAD wholesale).
+async function getPreMergeBaseSha(octokit: any, context: any, mergeCommitSha: string): Promise<string> {
+  const { data: commit } = await octokit.rest.repos.getCommit({
+    ...context.repo,
+    ref: mergeCommitSha
+  });
+  return commit.parents[0].sha;
+}
+
+// Fetch a file's text content at a given ref, or null if it didn't exist there.
+async function getContentAtRef(octokit: any, context: any, path: string, ref: string): Promise<string | null> {
+  try {
+    const { data } = await octokit.rest.repos.getContent({
+      ...context.repo,
+      path,
+      ref
+    });
+    return decodeContent(data.content);
+  } catch (error: any) {
+    if (error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 // Exported for testing
 export async function backportFiles(
-  octokit: any, 
-  context: any, 
-  sourceFolder: string, 
-  versionedFolder: string, 
-  files: any[], 
+  octokit: any,
+  context: any,
+  sourceFolder: string,
+  versionedFolder: string,
+  files: any[],
   branchName: string
 ): Promise<BackportStats> {
   // Track stats for reporting
@@ -308,6 +363,17 @@ export async function backportFiles(
   let deleted = 0;
   let skipped = 0;
   let errors = 0;
+  let conflicts = 0;
+  const conflictFiles: string[] = [];
+
+  const mergeCommitSha = context.payload.pull_request.merge_commit_sha;
+
+  // Every file in this PR shares the same pre-merge baseline, so resolve it
+  // once instead of per file.
+  let preMergeBaseSha: string | null = null;
+  if (mergeCommitSha) {
+    preMergeBaseSha = await getPreMergeBaseSha(octokit, context, mergeCommitSha);
+  }
 
   for (const file of files) {
     try {
@@ -329,9 +395,9 @@ export async function backportFiles(
       // Construct the target path in the versioned folder
       // For your structure, we need to copy to version-vX.Y.Z/[original path]
       const targetPath = `${versionedFolder}/${relativePath}`;
-      
+
       core.info(`Backporting ${file.filename} to ${targetPath}`);
-      
+
       // Get the file content from the merge commit on the base branch.
       // Using head.sha would capture the pre-merge state and miss changes
       // that the 3-way merge reconciliation applied on main (e.g. deletions
@@ -340,11 +406,14 @@ export async function backportFiles(
       const { data: content } = await octokit.rest.repos.getContent({
         ...context.repo,
         path: file.filename,
-        ref: context.payload.pull_request.merge_commit_sha
+        ref: mergeCommitSha
       });
-      
-      // Check if the target file already exists to get its SHA
+      const afterText = decodeContent(content.content);
+
+      // Check if the target file already exists, and fetch its content so we
+      // can attempt a patch merge instead of a blind overwrite.
       let sha = '';
+      let existingTargetText: string | null = null;
       try {
         const { data: existingFile } = await octokit.rest.repos.getContent({
           ...context.repo,
@@ -352,18 +421,54 @@ export async function backportFiles(
           ref: branchName
         });
         sha = existingFile.sha;
+        existingTargetText = decodeContent(existingFile.content);
       } catch (error) {
         // File doesn't exist yet, which is fine
         core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
       }
-      
+
+      // Decide what to write. Only a modified file landing on top of a
+      // versioned file that already exists can carry unrelated drift (the
+      // versioned copy may have its own independent history since the
+      // version branched, e.g. a later fix that a wholesale copy of main's
+      // current HEAD would silently revert). In that case, apply just this
+      // PR's own diff via a patch merge instead of overwriting outright.
+      // Added files, and files this version has never had, have no prior
+      // state to protect, so a direct copy is correct and unambiguous.
+      let finalText: string | null = afterText;
+      let isMerge = false;
+
+      if (file.status === 'modified' && existingTargetText !== null && preMergeBaseSha) {
+        const beforeText = await getContentAtRef(octokit, context, file.filename, preMergeBaseSha);
+        if (beforeText !== null && beforeText !== afterText) {
+          const patch = createPatch(file.filename, beforeText, afterText);
+          const merged = applyPatch(existingTargetText, patch);
+          if (merged === false) {
+            core.warning(
+              `Could not cleanly apply the diff for ${file.filename} onto ${targetPath}: ` +
+              `its content has diverged from what this PR changed. Leaving it unchanged; ` +
+              `backport this file's changes manually.`
+            );
+            conflicts++;
+            conflictFiles.push(targetPath);
+            continue;
+          }
+          finalText = merged;
+          isMerge = true;
+        }
+      }
+
+      const finalContent = encodeContent(finalText as string);
+      const commitVerb = isMerge ? 'Merge' : 'Copy';
+      const commitMessage = `Backport: ${commitVerb} ${file.filename} to ${targetPath}`;
+
       // Create or update the file in the versioned folder
       try {
         await octokit.rest.repos.createOrUpdateFileContents({
           ...context.repo,
           path: targetPath,
-          message: `Backport: Copy ${file.filename} to ${targetPath}`,
-          content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+          message: commitMessage,
+          content: finalContent,
           branch: branchName,
           sha: sha || undefined
         });
@@ -384,8 +489,8 @@ export async function backportFiles(
           await octokit.rest.repos.createOrUpdateFileContents({
             ...context.repo,
             path: targetPath,
-            message: `Backport: Copy ${file.filename} to ${targetPath}`,
-            content: typeof content.content === 'string' ? content.content : Buffer.from(content.content).toString('base64'),
+            message: commitMessage,
+            content: finalContent,
             branch: branchName,
             sha: conflictFile.sha
           });
@@ -421,11 +526,16 @@ export async function backportFiles(
     copied,
     deleted,
     skipped,
-    errors
+    errors,
+    conflicts,
+    conflictFiles
   };
 
-  core.info(`Backport stats - Copied: ${copied}, Deleted: ${deleted}, Skipped: ${skipped}, Errors: ${errors}`);
-  
+  core.info(
+    `Backport stats - Copied: ${copied}, Deleted: ${deleted}, Skipped: ${skipped}, ` +
+    `Errors: ${errors}, Conflicts: ${conflicts}`
+  );
+
   // Return the stats
   return stats;
 }
@@ -475,34 +585,67 @@ export async function checkExistingBackportPR(
 
 // Exported for testing
 export async function createBackportPR(
-  octokit: any, 
-  context: any, 
-  branchName: string, 
-  mainFolder: string, 
-  version: string, 
+  octokit: any,
+  context: any,
+  branchName: string,
+  mainFolder: string,
+  version: string,
   originalPRNumber: number,
-  originalPRTitle: string
+  originalPRTitle: string,
+  conflictFiles: string[] = []
 ): Promise<void> {
   // Create PR title in the format: [vX.Y] original title (#original_pr_number)
   const prTitle = `[v${version}] ${originalPRTitle} (#${originalPRNumber})`;
-  
+
+  let body = `This PR backports changes from ${mainFolder} to version v${version}.\n\nOriginal PR: #${originalPRNumber}`;
+  if (conflictFiles.length > 0) {
+    body += `\n\n## Manual review needed\n\nThe following files could not be merged automatically because their ` +
+      `content in this version has diverged from what the original PR changed. They were left unchanged here; ` +
+      `please backport the relevant changes by hand:\n\n${conflictFiles.map(f => `- \`${f}\``).join('\n')}`;
+  }
+
   // Create a PR
   const { data: pr } = await octokit.rest.pulls.create({
     ...context.repo,
     title: prTitle,
-    body: `This PR backports changes from ${mainFolder} to version v${version}.\n\nOriginal PR: #${originalPRNumber}`,
+    body,
     head: branchName,
     base: context.payload.repository.default_branch
   });
-  
+
   // Add labels to the new PR
   await octokit.rest.issues.addLabels({
     ...context.repo,
     issue_number: pr.number,
     labels: ['backport', `version-v${version}`]
   });
-  
+
   core.info(`Created backport PR #${pr.number} for ${mainFolder} to v${version}`);
+}
+
+// Surface merge conflicts on the original PR even when no backport PR could
+// be opened (e.g. every changed file conflicted, leaving nothing to commit).
+// Exported for testing
+export async function postConflictComment(
+  octokit: any,
+  context: any,
+  originalPRNumber: number,
+  mainFolder: string,
+  version: string,
+  conflictFiles: string[]
+): Promise<void> {
+  const body = `The automated backport of this PR to \`${mainFolder}\` v${version} could not merge the ` +
+    `following files, because their content in that version has diverged from what this PR changed. ` +
+    `They were left unchanged; please backport the relevant changes by hand:\n\n` +
+    conflictFiles.map(f => `- \`${f}\``).join('\n');
+
+  await octokit.rest.issues.createComment({
+    ...context.repo,
+    issue_number: originalPRNumber,
+    body
+  });
+
+  core.info(`Posted conflict comment on PR #${originalPRNumber} for ${mainFolder} v${version}`);
 }
 
 run();
