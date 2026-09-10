@@ -15,6 +15,11 @@ const VERSION_LABEL_REGEX = /^backport-v([\d.]+)$/;
 // serves at most 100 per page.
 const FILES_PER_PAGE = 100;
 
+export function fileTouchesSourceFolder(file: any, sourceFolder: string): boolean {
+  return file.filename.startsWith(`${sourceFolder}/`) ||
+    (file.status === 'renamed' && file.previous_filename?.startsWith(`${sourceFolder}/`));
+}
+
 // Type for a GitHub label
 interface GitHubLabel {
   name: string;
@@ -91,8 +96,7 @@ export async function run(): Promise<void> {
     // Group files by main folder
     const filesByFolder: Record<string, typeof files> = {};
     for (const mainFolder of Object.keys(FOLDER_MAPPING)) {
-      filesByFolder[mainFolder] = files.filter(file => 
-        file.filename.startsWith(`${mainFolder}/`));
+      filesByFolder[mainFolder] = files.filter(file => fileTouchesSourceFolder(file, mainFolder));
     }
     
     // Process each version label
@@ -154,6 +158,16 @@ export async function run(): Promise<void> {
         changedFiles, 
         branchName
       );
+
+      // Never open a normal-looking PR when one or more files failed to
+      // process. The per-file warnings remain in the job log, while failing
+      // the action makes the incomplete backport impossible to overlook.
+      if (stats.errors > 0) {
+        throw new Error(
+          `Backport to ${targetMainFolder} v${version} failed for ${stats.errors} file(s); ` +
+          `no pull request was created`
+        );
+      }
       
       // Only create a PR if we successfully copied or deleted at least one file
       if (stats.copied > 0 || stats.deleted > 0) {
@@ -249,15 +263,51 @@ interface BackportStats {
 
 // Decode a Contents API response body to UTF-8 text, regardless of whether
 // Octokit handed back a base64 string or an already-decoded buffer/array.
-function decodeContent(content: any): string {
-  if (typeof content === 'string') {
-    return Buffer.from(content, 'base64').toString('utf-8');
+function contentBuffer(content: any): Buffer {
+  return typeof content === 'string' ? Buffer.from(content, 'base64') : Buffer.from(content);
+}
+
+function contentBase64(content: any): string {
+  return contentBuffer(content).toString('base64');
+}
+
+function decodeTextContent(content: any): string | null {
+  const bytes = contentBuffer(content);
+  if (bytes.includes(0)) {
+    return null;
   }
-  return Buffer.from(content).toString('utf-8');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
 }
 
 function encodeContent(text: string): string {
   return Buffer.from(text, 'utf-8').toString('base64');
+}
+
+type TextPatchResult =
+  | { status: 'applied'; text: string; patch: string }
+  | { status: 'already-applied'; text: string; patch: string }
+  | { status: 'conflict'; patch: string };
+
+// applyPatch is not idempotent for insertion-only hunks. Check whether the
+// inverse change can be removed and reapplied to reproduce the target exactly
+// before applying the forward patch, so a manually backported insertion is
+// not duplicated.
+function applyTextChange(currentText: string, beforeText: string, afterText: string, filename: string): TextPatchResult {
+  const patch = createPatch(filename, beforeText, afterText);
+  const reversePatch = createPatch(filename, afterText, beforeText);
+  const reverted = applyPatch(currentText, reversePatch);
+  if (reverted !== false && applyPatch(reverted, patch) === currentText) {
+    return { status: 'already-applied', text: currentText, patch };
+  }
+
+  const merged = applyPatch(currentText, patch);
+  return merged === false
+    ? { status: 'conflict', patch }
+    : { status: 'applied', text: merged, patch };
 }
 
 // Delete a file from the versioned folder. Returns 'deleted' or 'absent'.
@@ -284,63 +334,173 @@ export async function deleteVersionedFile(
     throw error;
   }
 
-  // Delete the file, with SHA conflict retry
-  try {
-    await octokit.rest.repos.deleteFile({
-      ...context.repo,
-      path: targetPath,
-      message: `Backport: Delete ${targetPath} (removed in source)`,
-      sha,
-      branch: branchName
-    });
-  } catch (deleteError: any) {
-    const isShaConflict = deleteError.status === 409 || deleteError.message?.includes('but expected');
-    if (isShaConflict) {
-      core.info(`SHA conflict on delete for ${targetPath}, retrying...`);
-      const { data: conflictFile } = await octokit.rest.repos.getContent({
-        ...context.repo,
-        path: targetPath,
-        ref: branchName
-      });
-      await octokit.rest.repos.deleteFile({
-        ...context.repo,
-        path: targetPath,
-        message: `Backport: Delete ${targetPath} (removed in source)`,
-        sha: conflictFile.sha,
-        branch: branchName
-      });
-    } else {
-      throw deleteError;
-    }
-  }
+  // Do not retry a SHA conflict with a newly fetched SHA: the file changed
+  // after it was read, so deleting that new content could discard an
+  // independent version-specific edit. Propagate the failure instead.
+  await octokit.rest.repos.deleteFile({
+    ...context.repo,
+    path: targetPath,
+    message: `Backport: Delete ${targetPath} (removed in source)`,
+    sha,
+    branch: branchName
+  });
 
   core.info(`Deleted ${targetPath}`);
   return 'deleted';
 }
 
-// Fetch the SHA of the commit immediately before this PR's changes landed on
-// the base branch. For both merge commits and squash commits, parents[0] is
-// the base branch tip at merge time, so the file content at this SHA is the
-// PR's own diff baseline: unaffected by whatever else has merged to the
-// default branch since (which is exactly the drift that leaks into every
-// open backport when we instead copy today's HEAD wholesale).
-async function getPreMergeBaseSha(octokit: any, context: any, mergeCommitSha: string): Promise<string> {
-  const { data: commit } = await octokit.rest.repos.getCommit({
+function commitsMatch(original: any, merged: any): boolean {
+  return original.commit.message === merged.commit.message &&
+    original.commit.author?.name === merged.commit.author?.name &&
+    original.commit.author?.email === merged.commit.author?.email &&
+    original.commit.author?.date === merged.commit.author?.date;
+}
+
+// Resolve the base-branch tip immediately before the PR landed. Merge commits
+// and squash commits both use their first parent. A multi-commit rebase has no
+// merge commit, so identify its rewritten commits by stable author/message
+// metadata and walk across the complete sequence to its preceding parent.
+async function getPreMergeBaseSha(
+  octokit: any,
+  context: any,
+  mergeCommitSha: string
+): Promise<string> {
+  const { data: mergeTip } = await octokit.rest.repos.getCommit({
     ...context.repo,
     ref: mergeCommitSha
   });
-  return commit.parents[0].sha;
+
+  if (!mergeTip.parents?.[0]) {
+    throw new Error(`Merged commit ${mergeCommitSha} has no parent`);
+  }
+
+  const prCommitCount = context.payload.pull_request.commits || 1;
+  if (mergeTip.parents.length > 1) {
+    const expectedHeadSha = context.payload.pull_request.head?.sha;
+    if (!expectedHeadSha || mergeTip.parents[1]?.sha !== expectedHeadSha) {
+      throw new Error(
+        `PR #${context.payload.pull_request.number} was merged indirectly or has an unexpected merge commit; ` +
+        `automatic backporting is unsafe`
+      );
+    }
+    return mergeTip.parents[0].sha;
+  }
+  if (prCommitCount <= 1) {
+    return mergeTip.parents[0].sha;
+  }
+
+  const originalCommits = await octokit.paginate(
+    octokit.rest.pulls.listCommits,
+    {
+      ...context.repo,
+      pull_number: context.payload.pull_request.number,
+      per_page: FILES_PER_PAGE
+    }
+  );
+  if (originalCommits.length !== prCommitCount) {
+    throw new Error(
+      `Expected ${prCommitCount} commits for PR #${context.payload.pull_request.number}, ` +
+      `but GitHub returned ${originalCommits.length}`
+    );
+  }
+
+  // GitHub drops commits that were empty before a rebase-and-merge. Remove
+  // those from the expected landed sequence before matching from the tip.
+  const nonEmptyOriginalCommits = [];
+  for (const originalCommit of originalCommits) {
+    if (!originalCommit.sha) {
+      nonEmptyOriginalCommits.push(originalCommit);
+      continue;
+    }
+    const { data: commitDetails } = await octokit.rest.repos.getCommit({
+      ...context.repo,
+      ref: originalCommit.sha
+    });
+    if (!Array.isArray(commitDetails.files) || commitDetails.files.length > 0) {
+      nonEmptyOriginalCommits.push(originalCommit);
+    }
+  }
+  if (nonEmptyOriginalCommits.length === 0) {
+    throw new Error(`PR #${context.payload.pull_request.number} contains no landed non-empty commits`);
+  }
+
+  const immediateParentSha = mergeTip.parents[0].sha;
+  let current = mergeTip;
+  for (let index = nonEmptyOriginalCommits.length - 1; index >= 0; index--) {
+    if (!commitsMatch(nonEmptyOriginalCommits[index], current)) {
+      if (index === nonEmptyOriginalCommits.length - 1) {
+        const matchesEarlierCommit = nonEmptyOriginalCommits
+          .slice(0, -1)
+          .some(originalCommit => commitsMatch(originalCommit, current));
+        if (matchesEarlierCommit) {
+          throw new Error(
+            `The final commit of PR #${context.payload.pull_request.number} was dropped during rebase; ` +
+            `automatic baseline selection is unsafe`
+          );
+        }
+        // The tip does not match the PR's final commit, so this is a squash
+        // commit and its first parent is the pre-merge base.
+        return immediateParentSha;
+      }
+      // Once a rewritten tip commit matched, this is a rebase whose earlier
+      // sequence cannot be identified safely (for example, GitHub drops
+      // originally empty commits). Never fall back to a partial-PR baseline.
+      throw new Error(
+        `Could not identify the complete rebased commit sequence for PR ` +
+        `#${context.payload.pull_request.number}`
+      );
+    }
+    const parentSha = current.parents?.[0]?.sha;
+    if (!parentSha) {
+      throw new Error(`Could not walk the rebased commits for PR #${context.payload.pull_request.number}`);
+    }
+    if (index === 0) {
+      return parentSha;
+    }
+    const { data: parent } = await octokit.rest.repos.getCommit({
+      ...context.repo,
+      ref: parentSha
+    });
+    current = parent;
+  }
+
+  throw new Error(`Could not resolve the pre-merge base for PR #${context.payload.pull_request.number}`);
 }
 
-// Fetch a file's text content at a given ref, or null if it didn't exist there.
-async function getContentAtRef(octokit: any, context: any, path: string, ref: string): Promise<string | null> {
+async function hydrateFileContent(octokit: any, context: any, file: any): Promise<any> {
+  const contentUnavailable = file.encoding === 'none' ||
+    (typeof file.size === 'number' && file.size > 0 && !file.content);
+  if (!contentUnavailable) {
+    return file;
+  }
+  if (!file.sha) {
+    throw new Error('GitHub returned file metadata without content or a blob SHA');
+  }
+
+  const { data: blob } = await octokit.rest.git.getBlob({
+    ...context.repo,
+    file_sha: file.sha
+  });
+  if (!blob.content || blob.encoding !== 'base64') {
+    throw new Error(`GitHub did not return complete base64 content for blob ${file.sha}`);
+  }
+  return { ...file, content: blob.content, encoding: blob.encoding };
+}
+
+// Fetch a complete file at a given ref, or null if it did not exist there.
+// The Contents API omits bodies for files over 1 MB, so hydrate those through
+// the Git Blobs API before any copy, comparison, or patch operation.
+async function getFileAtRef(octokit: any, context: any, path: string, ref: string): Promise<any | null> {
   try {
     const { data } = await octokit.rest.repos.getContent({
       ...context.repo,
       path,
       ref
     });
-    return decodeContent(data.content);
+    if (Array.isArray(data) || data.type === 'dir') {
+      throw new Error(`${path} at ${ref} is not a file`);
+    }
+    return hydrateFileContent(octokit, context, data);
   } catch (error: any) {
     if (error.status === 404) {
       return null;
@@ -370,18 +530,41 @@ export async function backportFiles(
 
   // Every file in this PR shares the same pre-merge baseline, so resolve it
   // once instead of per file.
-  let preMergeBaseSha: string | null = null;
-  if (mergeCommitSha) {
-    preMergeBaseSha = await getPreMergeBaseSha(octokit, context, mergeCommitSha);
-  }
+  const preMergeBaseSha = mergeCommitSha
+    ? await getPreMergeBaseSha(octokit, context, mergeCommitSha)
+    : null;
 
   for (const file of files) {
     try {
+      const newPathInSourceFolder = file.filename.startsWith(`${sourceFolder}/`);
+      const oldPathInSourceFolder = file.status === 'renamed' &&
+        file.previous_filename?.startsWith(`${sourceFolder}/`);
+
+      // A rename out of this mapped source folder is a removal for this
+      // product/version. A rename into it is an addition. Only a rename whose
+      // old and new paths are both inside the folder is a content-preserving
+      // rename operation.
+      if (file.status === 'renamed' && oldPathInSourceFolder && !newPathInSourceFolder) {
+        const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
+        const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
+        const result = await deleteVersionedFile(octokit, context, oldTargetPath, branchName);
+        if (result === 'deleted') {
+          deleted++;
+        } else {
+          skipped++;
+        }
+        continue;
+      }
+
+      const effectiveStatus = file.status === 'renamed' && !oldPathInSourceFolder
+        ? 'added'
+        : file.status;
+
       // Extract the relative path within the source folder
       const relativePath = file.filename.substring(sourceFolder.length + 1);
 
       // Delete file from versioned folder if it was removed in the PR
-      if (file.status === 'removed') {
+      if (effectiveStatus === 'removed') {
         const targetPath = `${versionedFolder}/${relativePath}`;
         const result = await deleteVersionedFile(octokit, context, targetPath, branchName);
         if (result === 'deleted') {
@@ -403,47 +586,91 @@ export async function backportFiles(
       // that the 3-way merge reconciliation applied on main (e.g. deletions
       // silently restored, paths altered). merge_commit_sha is populated for
       // merged PRs across squash, merge-commit, and rebase strategies.
-      const { data: content } = await octokit.rest.repos.getContent({
-        ...context.repo,
-        path: file.filename,
-        ref: mergeCommitSha
-      });
-      const afterText = decodeContent(content.content);
+      const sourceFile = await getFileAtRef(octokit, context, file.filename, mergeCommitSha);
+      if (!sourceFile) {
+        throw new Error(`Merged source file ${file.filename} is missing at ${mergeCommitSha}`);
+      }
+      const afterBase64 = contentBase64(sourceFile.content);
 
       // Check if the target file already exists, and fetch its content so we
       // can attempt a patch merge instead of a blind overwrite.
-      let sha = '';
-      let existingTargetText: string | null = null;
-      try {
-        const { data: existingFile } = await octokit.rest.repos.getContent({
-          ...context.repo,
-          path: targetPath,
-          ref: branchName
-        });
-        sha = existingFile.sha;
-        existingTargetText = decodeContent(existingFile.content);
-      } catch (error) {
-        // File doesn't exist yet, which is fine
+      const existingTargetFile = await getFileAtRef(octokit, context, targetPath, branchName);
+      if (!existingTargetFile) {
         core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
       }
 
-      // Decide what to write. Only a modified file landing on top of a
-      // versioned file that already exists can carry unrelated drift (the
-      // versioned copy may have its own independent history since the
-      // version branched, e.g. a later fix that a wholesale copy of main's
-      // current HEAD would silently revert). In that case, apply just this
-      // PR's own diff via a patch merge instead of overwriting outright.
-      // Added files, and files this version has never had, have no prior
-      // state to protect, so a direct copy is correct and unambiguous.
-      let finalText: string | null = afterText;
-      let isMerge = false;
+      // Reusing an existing destination for an add or rename is ambiguous: it
+      // may contain version-specific history unrelated to this PR.
+      if ((effectiveStatus === 'added' || effectiveStatus === 'renamed') && existingTargetFile) {
+        core.warning(`Target path ${targetPath} already exists; leaving it unchanged for manual review.`);
+        conflicts++;
+        conflictFiles.push(targetPath);
+        continue;
+      }
 
-      if (file.status === 'modified' && existingTargetText !== null && preMergeBaseSha) {
-        const beforeText = await getContentAtRef(octokit, context, file.filename, preMergeBaseSha);
-        if (beforeText !== null && beforeText !== afterText) {
-          const patch = createPatch(file.filename, beforeText, afterText);
-          const merged = applyPatch(existingTargetText, patch);
-          if (merged === false) {
+      // A rename's version-specific state lives at its old path. Always use
+      // that content as the patch target; the new path was checked above for
+      // an explicit destination collision.
+      let patchTargetFile = effectiveStatus === 'modified' ? existingTargetFile : null;
+      if (effectiveStatus === 'renamed' && file.previous_filename && preMergeBaseSha) {
+        const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
+        const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
+        patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchName);
+      }
+
+      // Modified and renamed files may have independent version-specific
+      // history. Apply only this PR's before/after diff to that current text.
+      // Added files, and files this version has never had, have no prior state
+      // to protect, so preserve and copy their original bytes directly.
+      let finalContent = afterBase64;
+      let isMerge = false;
+      let patchTexts: { before: string; after: string } | null = null;
+
+      const isPatchable = effectiveStatus === 'modified' || effectiveStatus === 'renamed';
+      if (isPatchable && patchTargetFile && preMergeBaseSha) {
+        const beforePath = effectiveStatus === 'renamed' && file.previous_filename
+          ? file.previous_filename
+          : file.filename;
+        const beforeFile = await getFileAtRef(octokit, context, beforePath, preMergeBaseSha);
+        if (!beforeFile) {
+          core.warning(
+            `Could not find the pre-merge content for ${beforePath}. Leaving ${targetPath} unchanged; ` +
+            `backport this file's changes manually.`
+          );
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+
+        const beforeBase64 = contentBase64(beforeFile.content);
+        if (beforeBase64 === afterBase64) {
+          if (effectiveStatus === 'renamed') {
+            // A pure rename still needs a write at the new path, but its
+            // version-specific content must remain unchanged.
+            finalContent = contentBase64(patchTargetFile.content);
+            isMerge = true;
+          } else {
+            core.info(`No net merged change for ${file.filename}, skipping`);
+            skipped++;
+            continue;
+          }
+        } else {
+          const beforeText = decodeTextContent(beforeFile.content);
+          const afterText = decodeTextContent(sourceFile.content);
+          const patchTargetText = decodeTextContent(patchTargetFile.content);
+          if (beforeText === null || afterText === null || patchTargetText === null) {
+            core.warning(
+              `Cannot safely patch binary content for ${file.filename} onto ${targetPath}; ` +
+              `leaving it unchanged for manual review.`
+            );
+            conflicts++;
+            conflictFiles.push(targetPath);
+            continue;
+          }
+
+          const patchResult = applyTextChange(patchTargetText, beforeText, afterText, file.filename);
+          patchTexts = { before: beforeText, after: afterText };
+          if (patchResult.status === 'conflict') {
             core.warning(
               `Could not cleanly apply the diff for ${file.filename} onto ${targetPath}: ` +
               `its content has diverged from what this PR changed. Leaving it unchanged; ` +
@@ -453,12 +680,16 @@ export async function backportFiles(
             conflictFiles.push(targetPath);
             continue;
           }
-          finalText = merged;
+          if (patchResult.status === 'already-applied' && effectiveStatus === 'modified') {
+            core.info(`Changes for ${file.filename} are already present in ${targetPath}, skipping`);
+            skipped++;
+            continue;
+          }
+          finalContent = encodeContent(patchResult.text);
           isMerge = true;
         }
       }
 
-      const finalContent = encodeContent(finalText as string);
       const commitVerb = isMerge ? 'Merge' : 'Copy';
       const commitMessage = `Backport: ${commitVerb} ${file.filename} to ${targetPath}`;
 
@@ -470,29 +701,43 @@ export async function backportFiles(
           message: commitMessage,
           content: finalContent,
           branch: branchName,
-          sha: sha || undefined
+          sha: existingTargetFile?.sha
         });
       } catch (createError: any) {
-        // Check if this is a SHA conflict (file was created between check and write)
+        // If the file changed between read and write, never resend stale
+        // content. Only a modified text file with a reusable source patch can
+        // be recalculated safely; additions and rename collisions need review.
         const isShaConflict = createError.status === 409 || createError.message?.includes('but expected');
         if (isShaConflict) {
-          core.info(`SHA conflict detected for ${targetPath}, retrying with current SHA...`);
-
-          // Re-fetch the current SHA
-          const { data: conflictFile } = await octokit.rest.repos.getContent({
-            ...context.repo,
-            path: targetPath,
-            ref: branchName
-          });
-
-          // Retry with the correct SHA
+          const currentTargetFile = await getFileAtRef(octokit, context, targetPath, branchName);
+          if (!currentTargetFile) {
+            core.warning(`Target ${targetPath} disappeared concurrently; leaving it for manual review.`);
+            conflicts++;
+            conflictFiles.push(targetPath);
+            continue;
+          }
+          const currentTargetText = decodeTextContent(currentTargetFile.content);
+          const retryResult = effectiveStatus === 'modified' && patchTexts && currentTargetText !== null
+            ? applyTextChange(currentTargetText, patchTexts.before, patchTexts.after, file.filename)
+            : { status: 'conflict' as const };
+          if (retryResult.status === 'conflict') {
+            core.warning(`Target ${targetPath} changed concurrently; leaving it unchanged for manual review.`);
+            conflicts++;
+            conflictFiles.push(targetPath);
+            continue;
+          }
+          if (retryResult.status === 'already-applied') {
+            core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
+            skipped++;
+            continue;
+          }
           await octokit.rest.repos.createOrUpdateFileContents({
             ...context.repo,
             path: targetPath,
             message: commitMessage,
-            content: finalContent,
+            content: encodeContent(retryResult.text),
             branch: branchName,
-            sha: conflictFile.sha
+            sha: currentTargetFile.sha
           });
           core.info(`Retry successful for ${targetPath}`);
         } else {
@@ -504,7 +749,7 @@ export async function backportFiles(
       core.info(`Backported ${file.filename} to ${targetPath}`);
 
       // For renamed files, also delete the old path from the versioned folder
-      if (file.status === 'renamed' && file.previous_filename) {
+      if (effectiveStatus === 'renamed' && file.previous_filename) {
         const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
         const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
         const result = await deleteVersionedFile(octokit, context, oldTargetPath, branchName);
