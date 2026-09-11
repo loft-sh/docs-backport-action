@@ -1,6 +1,6 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import { createPatch, applyPatch } from 'diff';
+import { createPatch, applyPatch, diffLines } from 'diff';
 
 // Define main folders and their versioned counterparts
 const FOLDER_MAPPING: Record<string, string> = {
@@ -298,10 +298,31 @@ type TextPatchResult =
 // not duplicated.
 function applyTextChange(currentText: string, beforeText: string, afterText: string, filename: string): TextPatchResult {
   const patch = createPatch(filename, beforeText, afterText);
-  const reversePatch = createPatch(filename, afterText, beforeText);
-  const reverted = applyPatch(currentText, reversePatch);
-  if (reverted !== false && applyPatch(reverted, patch) === currentText) {
+
+  // Exact states are unambiguous. In particular, checking the pre-image first
+  // prevents boundary deletions from being mistaken for already-applied: an
+  // inverse insertion followed by the deletion can otherwise round-trip the
+  // unchanged pre-image back to itself.
+  if (currentText === beforeText) {
+    const applied = applyPatch(currentText, patch);
+    return applied === false
+      ? { status: 'conflict', patch }
+      : { status: 'applied', text: applied, patch };
+  }
+  if (currentText === afterText) {
     return { status: 'already-applied', text: currentText, patch };
+  }
+
+  // The inverse round-trip is only a reliable idempotence signal for a pure
+  // insertion. For patches containing deletions, inverse insertion can also
+  // round-trip a pending deletion, so let the forward patch decide instead.
+  const hasDeletions = diffLines(beforeText, afterText).some(change => change.removed);
+  if (!hasDeletions) {
+    const reversePatch = createPatch(filename, afterText, beforeText);
+    const reverted = applyPatch(currentText, reversePatch);
+    if (reverted !== false && applyPatch(reverted, patch) === currentText) {
+      return { status: 'already-applied', text: currentText, patch };
+    }
   }
 
   const merged = applyPatch(currentText, patch);
@@ -625,6 +646,7 @@ export async function backportFiles(
       let finalContent = afterBase64;
       let isMerge = false;
       let patchTexts: { before: string; after: string } | null = null;
+      let patchBytes: { before: string; after: string } | null = null;
 
       const isPatchable = effectiveStatus === 'modified' || effectiveStatus === 'renamed';
       if (isPatchable && patchTargetFile && preMergeBaseSha) {
@@ -643,6 +665,7 @@ export async function backportFiles(
         }
 
         const beforeBase64 = contentBase64(beforeFile.content);
+        const patchTargetBase64 = contentBase64(patchTargetFile.content);
         if (beforeBase64 === afterBase64) {
           if (effectiveStatus === 'renamed') {
             // A pure rename still needs a write at the new path, but its
@@ -654,6 +677,23 @@ export async function backportFiles(
             skipped++;
             continue;
           }
+        } else if (patchTargetBase64 === afterBase64) {
+          if (effectiveStatus === 'renamed') {
+            // The content change is already present at the old path; preserve
+            // its bytes while completing the rename.
+            finalContent = patchTargetBase64;
+            isMerge = true;
+          } else {
+            core.info(`Changes for ${file.filename} are already present in ${targetPath}, skipping`);
+            skipped++;
+            continue;
+          }
+        } else if (patchTargetBase64 === beforeBase64) {
+          // With no independent target drift, copying the exact post-image is
+          // safe for both text and binary files.
+          finalContent = afterBase64;
+          patchBytes = { before: beforeBase64, after: afterBase64 };
+          isMerge = true;
         } else {
           const beforeText = decodeTextContent(beforeFile.content);
           const afterText = decodeTextContent(sourceFile.content);
@@ -670,6 +710,7 @@ export async function backportFiles(
 
           const patchResult = applyTextChange(patchTargetText, beforeText, afterText, file.filename);
           patchTexts = { before: beforeText, after: afterText };
+          patchBytes = { before: beforeBase64, after: afterBase64 };
           if (patchResult.status === 'conflict') {
             core.warning(
               `Could not cleanly apply the diff for ${file.filename} onto ${targetPath}: ` +
@@ -717,25 +758,39 @@ export async function backportFiles(
             continue;
           }
           const currentTargetText = decodeTextContent(currentTargetFile.content);
-          const retryResult = effectiveStatus === 'modified' && patchTexts && currentTargetText !== null
-            ? applyTextChange(currentTargetText, patchTexts.before, patchTexts.after, file.filename)
-            : { status: 'conflict' as const };
-          if (retryResult.status === 'conflict') {
-            core.warning(`Target ${targetPath} changed concurrently; leaving it unchanged for manual review.`);
-            conflicts++;
-            conflictFiles.push(targetPath);
-            continue;
-          }
-          if (retryResult.status === 'already-applied') {
+          const currentTargetBase64 = contentBase64(currentTargetFile.content);
+          if (patchBytes && currentTargetBase64 === patchBytes.after) {
             core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
             skipped++;
             continue;
+          }
+
+          let retryContent: string | null = null;
+          if (patchBytes && currentTargetBase64 === patchBytes.before) {
+            retryContent = patchBytes.after;
+          }
+          if (retryContent === null) {
+            const retryResult = effectiveStatus === 'modified' && patchTexts && currentTargetText !== null
+              ? applyTextChange(currentTargetText, patchTexts.before, patchTexts.after, file.filename)
+              : { status: 'conflict' as const };
+            if (retryResult.status === 'conflict') {
+              core.warning(`Target ${targetPath} changed concurrently; leaving it unchanged for manual review.`);
+              conflicts++;
+              conflictFiles.push(targetPath);
+              continue;
+            }
+            if (retryResult.status === 'already-applied') {
+              core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
+              skipped++;
+              continue;
+            }
+            retryContent = encodeContent(retryResult.text);
           }
           await octokit.rest.repos.createOrUpdateFileContents({
             ...context.repo,
             path: targetPath,
             message: commitMessage,
-            content: encodeContent(retryResult.text),
+            content: retryContent,
             branch: branchName,
             sha: currentTargetFile.sha
           });

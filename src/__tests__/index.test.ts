@@ -1297,6 +1297,56 @@ describe('Docs Backport Action Tests', () => {
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
     });
 
+    it.each([
+      {
+        boundary: 'last',
+        before: 'header\nremove me\n',
+        after: 'header\n'
+      },
+      {
+        boundary: 'first',
+        before: 'remove me\nfooter\n',
+        after: 'footer\n'
+      }
+    ])('applies a pending deletion at the $boundary line', async ({ before, after }) => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/test.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(after).toString('base64') } });
+              }
+              if (path === 'vcluster/test.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(before).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/test.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(before).toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.skipped).toBe(0);
+      const written = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
+      expect(Buffer.from(written, 'base64').toString('utf-8')).toBe(after);
+    });
+
     it('skips the file and reports a conflict when the versioned copy diverged in the same spot the PR changed', async () => {
       // The versioned file already has a different edit to the exact line
       // the PR changes, so there is no context-safe way to apply the patch.
@@ -1394,6 +1444,88 @@ describe('Docs Backport Action Tests', () => {
       expect(stats.copied).toBe(1);
       const written = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
       expect(Buffer.from(written, 'base64')).toEqual(binary);
+    });
+
+    it('copies a modified binary when the versioned bytes match the baseline', async () => {
+      const beforeBinary = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]);
+      const afterBinary = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x02]);
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/image.png' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: afterBinary.toString('base64') } });
+              }
+              if (path === 'vcluster/image.png' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: beforeBinary.toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/image.png') {
+                return Promise.resolve({
+                  data: { content: beforeBinary.toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/image.png', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      const written = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
+      expect(Buffer.from(written, 'base64')).toEqual(afterBinary);
+    });
+
+    it('skips a modified binary when the versioned bytes already match the post-image', async () => {
+      const beforeBinary = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]);
+      const afterBinary = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x02]);
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/image.png' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: afterBinary.toString('base64') } });
+              }
+              if (path === 'vcluster/image.png' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: beforeBinary.toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/image.png') {
+                return Promise.resolve({
+                  data: { content: afterBinary.toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn()
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/image.png', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.skipped).toBe(1);
+      expect(stats.copied).toBe(0);
+      expect(stats.conflicts).toBe(0);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
     });
 
     it('hydrates omitted Contents API bodies through the Git Blobs API', async () => {
