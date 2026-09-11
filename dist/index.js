@@ -29974,6 +29974,9 @@ const VERSION_LABEL_REGEX = /^backport-v([\d.]+)$/;
 // GitHub's pulls.listFiles endpoint returns 30 files per page by default and
 // serves at most 100 per page.
 const FILES_PER_PAGE = 100;
+const SUPPORTED_FILE_STATUSES = new Set([
+    'added', 'removed', 'modified', 'renamed', 'changed', 'copied', 'unchanged'
+]);
 function fileTouchesSourceFolder(file, sourceFolder) {
     return file.filename.startsWith(`${sourceFolder}/`) ||
         (file.status === 'renamed' && file.previous_filename?.startsWith(`${sourceFolder}/`));
@@ -30038,67 +30041,91 @@ async function run() {
         for (const mainFolder of Object.keys(FOLDER_MAPPING)) {
             filesByFolder[mainFolder] = files.filter(file => fileTouchesSourceFolder(file, mainFolder));
         }
+        const mergeCommitSha = context.payload.pull_request.merge_commit_sha;
+        if (!mergeCommitSha) {
+            throw new Error(`Merged PR #${prNumber} has no merge_commit_sha; refusing an unsafe wholesale copy`);
+        }
+        // This baseline is PR-wide. Resolve it lazily so an already-existing or
+        // irrelevant backport does not perform commit-history work, then reuse
+        // the same promise for every requested version.
+        let preMergeBaseShaPromise = null;
+        const versionErrors = [];
         // Process each version label
         for (const version of versionLabels) {
-            // Determine which main folder this version applies to
-            // For vcluster: typically 0.x versions
-            // For platform: typically 4.x versions
-            let targetMainFolder;
-            if (version.startsWith('0.') || version.startsWith('1.')) {
-                targetMainFolder = 'vcluster';
+            try {
+                // Determine which main folder this version applies to
+                // For vcluster: typically 0.x versions
+                // For platform: typically 4.x versions
+                let targetMainFolder;
+                if (version.startsWith('0.') || version.startsWith('1.')) {
+                    targetMainFolder = 'vcluster';
+                }
+                else {
+                    targetMainFolder = 'platform';
+                }
+                const changedFiles = filesByFolder[targetMainFolder];
+                if (!changedFiles || changedFiles.length === 0) {
+                    core.info(`No files changed in ${targetMainFolder} for version ${version}, skipping`);
+                    continue;
+                }
+                // Check if a backport PR already exists for this PR and version
+                const existingPR = await checkExistingBackportPR(octokit, context, targetMainFolder, version, prNumber);
+                if (existingPR) {
+                    core.info(`Backport PR #${existingPR.number} already exists for ${targetMainFolder} to v${version}, skipping`);
+                    continue;
+                }
+                // Construct the versioned folder path based on our folder structure
+                // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
+                // For vcluster versions, always add .0 suffix
+                let formattedVersion = version;
+                if (targetMainFolder === 'vcluster') {
+                    formattedVersion = `${version}.0`;
+                }
+                const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
+                if (!preMergeBaseShaPromise) {
+                    preMergeBaseShaPromise = getPreMergeBaseSha(octokit, context, mergeCommitSha);
+                }
+                const preMergeBaseSha = await preMergeBaseShaPromise;
+                // Create a branch for this backport
+                const timestamp = new Date().getTime();
+                const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
+                // Create the branch
+                await createBranchForBackport(octokit, context, branchName);
+                // Process files and get stats
+                const stats = await backportFiles(octokit, context, targetMainFolder, versionedFolder, changedFiles, branchName, preMergeBaseSha);
+                // Never open a normal-looking PR when one or more files failed to
+                // process. The per-file warnings remain in the job log, while failing
+                // the action makes the incomplete backport impossible to overlook.
+                if (stats.errors > 0) {
+                    throw new Error(`Backport to ${targetMainFolder} v${version} failed for ${stats.errors} file(s); ` +
+                        `no pull request was created`);
+                }
+                // Only create a PR if we successfully copied or deleted at least one file
+                if (stats.copied > 0 || stats.deleted > 0) {
+                    // Get original PR title
+                    const originalPRTitle = context.payload.pull_request.title;
+                    // Create a PR
+                    await createBackportPR(octokit, context, branchName, targetMainFolder, version, prNumber, originalPRTitle, stats.conflictFiles);
+                }
+                else {
+                    core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
+                }
+                // Conflicts need a human regardless of whether a backport PR got
+                // created (an all-conflicts backport has nothing to open a PR with,
+                // since nothing was actually committed to the branch).
+                if (stats.conflictFiles.length > 0) {
+                    await postConflictComment(octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles);
+                }
             }
-            else {
-                targetMainFolder = 'platform';
+            catch (error) {
+                const message = `Backport for v${version} failed: ${error.message}`;
+                core.warning(message);
+                versionErrors.push(message);
             }
-            const changedFiles = filesByFolder[targetMainFolder];
-            if (!changedFiles || changedFiles.length === 0) {
-                core.info(`No files changed in ${targetMainFolder} for version ${version}, skipping`);
-                continue;
-            }
-            // Check if a backport PR already exists for this PR and version
-            const existingPR = await checkExistingBackportPR(octokit, context, targetMainFolder, version, prNumber);
-            if (existingPR) {
-                core.info(`Backport PR #${existingPR.number} already exists for ${targetMainFolder} to v${version}, skipping`);
-                continue;
-            }
-            // Construct the versioned folder path based on our folder structure
-            // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
-            // For vcluster versions, always add .0 suffix
-            let formattedVersion = version;
-            if (targetMainFolder === 'vcluster') {
-                formattedVersion = `${version}.0`;
-            }
-            const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
-            // Create a branch for this backport
-            const timestamp = new Date().getTime();
-            const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
-            // Create the branch
-            await createBranchForBackport(octokit, context, branchName);
-            // Process files and get stats
-            const stats = await backportFiles(octokit, context, targetMainFolder, versionedFolder, changedFiles, branchName);
-            // Never open a normal-looking PR when one or more files failed to
-            // process. The per-file warnings remain in the job log, while failing
-            // the action makes the incomplete backport impossible to overlook.
-            if (stats.errors > 0) {
-                throw new Error(`Backport to ${targetMainFolder} v${version} failed for ${stats.errors} file(s); ` +
-                    `no pull request was created`);
-            }
-            // Only create a PR if we successfully copied or deleted at least one file
-            if (stats.copied > 0 || stats.deleted > 0) {
-                // Get original PR title
-                const originalPRTitle = context.payload.pull_request.title;
-                // Create a PR
-                await createBackportPR(octokit, context, branchName, targetMainFolder, version, prNumber, originalPRTitle, stats.conflictFiles);
-            }
-            else {
-                core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
-            }
-            // Conflicts need a human regardless of whether a backport PR got
-            // created (an all-conflicts backport has nothing to open a PR with,
-            // since nothing was actually committed to the branch).
-            if (stats.conflictFiles.length > 0) {
-                await postConflictComment(octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles);
-            }
+        }
+        if (versionErrors.length > 0) {
+            throw new Error(`${versionErrors.length} backport version(s) failed after all labels were processed: ` +
+                versionErrors.join('; '));
         }
     }
     catch (error) {
@@ -30363,7 +30390,7 @@ async function getFileAtRef(octokit, context, path, ref) {
     }
 }
 // Exported for testing
-async function backportFiles(octokit, context, sourceFolder, versionedFolder, files, branchName) {
+async function backportFiles(octokit, context, sourceFolder, versionedFolder, files, branchName, resolvedPreMergeBaseSha) {
     // Track stats for reporting
     let copied = 0;
     let deleted = 0;
@@ -30372,15 +30399,31 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
     let conflicts = 0;
     const conflictFiles = [];
     const mergeCommitSha = context.payload.pull_request.merge_commit_sha;
+    if (!mergeCommitSha) {
+        throw new Error('Merged pull request payload is missing merge_commit_sha; refusing an unsafe wholesale copy');
+    }
     // Every file in this PR shares the same pre-merge baseline, so resolve it
-    // once instead of per file.
-    const preMergeBaseSha = mergeCommitSha
-        ? await getPreMergeBaseSha(octokit, context, mergeCommitSha)
-        : null;
+    // once instead of per file. run() supplies the PR-wide cached value; direct
+    // callers and tests can let this function resolve it lazily.
+    const needsPatchBaseline = files.some(file => file.status === 'modified' || file.status === 'changed' ||
+        ((file.status === 'renamed' || file.status === 'copied') &&
+            file.filename.startsWith(`${sourceFolder}/`) &&
+            file.previous_filename?.startsWith(`${sourceFolder}/`)));
+    const preMergeBaseSha = resolvedPreMergeBaseSha ||
+        (needsPatchBaseline ? await getPreMergeBaseSha(octokit, context, mergeCommitSha) : null);
     for (const file of files) {
         try {
+            if (!SUPPORTED_FILE_STATUSES.has(file.status)) {
+                throw new Error(`Unsupported GitHub file status "${file.status}" for ${file.filename}`);
+            }
+            if (file.status === 'unchanged') {
+                core.info(`File ${file.filename} is unchanged, skipping`);
+                skipped++;
+                continue;
+            }
             const newPathInSourceFolder = file.filename.startsWith(`${sourceFolder}/`);
-            const oldPathInSourceFolder = file.status === 'renamed' &&
+            const hasSourcePath = file.status === 'renamed' || file.status === 'copied';
+            const oldPathInSourceFolder = hasSourcePath &&
                 file.previous_filename?.startsWith(`${sourceFolder}/`);
             // A rename out of this mapped source folder is a removal for this
             // product/version. A rename into it is an addition. Only a rename whose
@@ -30398,9 +30441,13 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
                 }
                 continue;
             }
-            const effectiveStatus = file.status === 'renamed' && !oldPathInSourceFolder
-                ? 'added'
-                : file.status;
+            let effectiveStatus = file.status;
+            if (file.status === 'changed') {
+                effectiveStatus = 'modified';
+            }
+            else if (hasSourcePath && !oldPathInSourceFolder) {
+                effectiveStatus = 'added';
+            }
             // Extract the relative path within the source folder
             const relativePath = file.filename.substring(sourceFolder.length + 1);
             // Delete file from versioned folder if it was removed in the PR
@@ -30437,7 +30484,8 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
             }
             // Reusing an existing destination for an add or rename is ambiguous: it
             // may contain version-specific history unrelated to this PR.
-            if ((effectiveStatus === 'added' || effectiveStatus === 'renamed') && existingTargetFile) {
+            if ((effectiveStatus === 'added' || effectiveStatus === 'renamed' || effectiveStatus === 'copied') &&
+                existingTargetFile) {
                 core.warning(`Target path ${targetPath} already exists; leaving it unchanged for manual review.`);
                 conflicts++;
                 conflictFiles.push(targetPath);
@@ -30447,7 +30495,7 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
             // that content as the patch target; the new path was checked above for
             // an explicit destination collision.
             let patchTargetFile = effectiveStatus === 'modified' ? existingTargetFile : null;
-            if (effectiveStatus === 'renamed' && file.previous_filename && preMergeBaseSha) {
+            if ((effectiveStatus === 'renamed' || effectiveStatus === 'copied') && file.previous_filename) {
                 const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
                 const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
                 patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchName);
@@ -30460,9 +30508,10 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
             let isMerge = false;
             let patchTexts = null;
             let patchBytes = null;
-            const isPatchable = effectiveStatus === 'modified' || effectiveStatus === 'renamed';
+            const isPatchable = effectiveStatus === 'modified' ||
+                effectiveStatus === 'renamed' || effectiveStatus === 'copied';
             if (isPatchable && patchTargetFile && preMergeBaseSha) {
-                const beforePath = effectiveStatus === 'renamed' && file.previous_filename
+                const beforePath = (effectiveStatus === 'renamed' || effectiveStatus === 'copied') && file.previous_filename
                     ? file.previous_filename
                     : file.filename;
                 const beforeFile = await getFileAtRef(octokit, context, beforePath, preMergeBaseSha);
@@ -30476,7 +30525,7 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
                 const beforeBase64 = contentBase64(beforeFile.content);
                 const patchTargetBase64 = contentBase64(patchTargetFile.content);
                 if (beforeBase64 === afterBase64) {
-                    if (effectiveStatus === 'renamed') {
+                    if (effectiveStatus === 'renamed' || effectiveStatus === 'copied') {
                         // A pure rename still needs a write at the new path, but its
                         // version-specific content must remain unchanged.
                         finalContent = contentBase64(patchTargetFile.content);
@@ -30489,7 +30538,7 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
                     }
                 }
                 else if (patchTargetBase64 === afterBase64) {
-                    if (effectiveStatus === 'renamed') {
+                    if (effectiveStatus === 'renamed' || effectiveStatus === 'copied') {
                         // The content change is already present at the old path; preserve
                         // its bytes while completing the rename.
                         finalContent = patchTargetBase64;
@@ -30567,41 +30616,53 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
                     }
                     const currentTargetText = decodeTextContent(currentTargetFile.content);
                     const currentTargetBase64 = contentBase64(currentTargetFile.content);
+                    let destinationAlreadyReady = false;
                     if (patchBytes && currentTargetBase64 === patchBytes.after) {
-                        core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
-                        skipped++;
-                        continue;
-                    }
-                    let retryContent = null;
-                    if (patchBytes && currentTargetBase64 === patchBytes.before) {
-                        retryContent = patchBytes.after;
-                    }
-                    if (retryContent === null) {
-                        const retryResult = effectiveStatus === 'modified' && patchTexts && currentTargetText !== null
-                            ? applyTextChange(currentTargetText, patchTexts.before, patchTexts.after, file.filename)
-                            : { status: 'conflict' };
-                        if (retryResult.status === 'conflict') {
-                            core.warning(`Target ${targetPath} changed concurrently; leaving it unchanged for manual review.`);
-                            conflicts++;
-                            conflictFiles.push(targetPath);
-                            continue;
+                        if (effectiveStatus === 'renamed' || effectiveStatus === 'copied') {
+                            // The destination appeared concurrently with exactly the bytes
+                            // we intended to write. Treat it as ready so a rename can still
+                            // remove its old path (copies simply finish successfully).
+                            core.info(`Concurrent destination already contains the changes for ${file.filename}`);
+                            destinationAlreadyReady = true;
                         }
-                        if (retryResult.status === 'already-applied') {
+                        else {
                             core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
                             skipped++;
                             continue;
                         }
-                        retryContent = encodeContent(retryResult.text);
                     }
-                    await octokit.rest.repos.createOrUpdateFileContents({
-                        ...context.repo,
-                        path: targetPath,
-                        message: commitMessage,
-                        content: retryContent,
-                        branch: branchName,
-                        sha: currentTargetFile.sha
-                    });
-                    core.info(`Retry successful for ${targetPath}`);
+                    if (!destinationAlreadyReady) {
+                        let retryContent = null;
+                        if (patchBytes && currentTargetBase64 === patchBytes.before) {
+                            retryContent = patchBytes.after;
+                        }
+                        if (retryContent === null) {
+                            const retryResult = effectiveStatus === 'modified' && patchTexts && currentTargetText !== null
+                                ? applyTextChange(currentTargetText, patchTexts.before, patchTexts.after, file.filename)
+                                : { status: 'conflict' };
+                            if (retryResult.status === 'conflict') {
+                                core.warning(`Target ${targetPath} changed concurrently; leaving it unchanged for manual review.`);
+                                conflicts++;
+                                conflictFiles.push(targetPath);
+                                continue;
+                            }
+                            if (retryResult.status === 'already-applied') {
+                                core.info(`Concurrent update already contains the changes for ${file.filename}, skipping`);
+                                skipped++;
+                                continue;
+                            }
+                            retryContent = encodeContent(retryResult.text);
+                        }
+                        await octokit.rest.repos.createOrUpdateFileContents({
+                            ...context.repo,
+                            path: targetPath,
+                            message: commitMessage,
+                            content: retryContent,
+                            branch: branchName,
+                            sha: currentTargetFile.sha
+                        });
+                        core.info(`Retry successful for ${targetPath}`);
+                    }
                 }
                 else {
                     throw createError;

@@ -291,11 +291,92 @@ describe('Docs Backport Action Tests', () => {
 
       expect(context.payload.pull_request.merged).toBe(false);
     });
+
+    it('continues with later version labels after one version fails', async () => {
+      const getCommit = jest.fn().mockResolvedValue({
+        data: { parents: [{ sha: 'base-before-pr' }] }
+      });
+      const getContent = jest.fn().mockImplementation(({ path, ref }: any) => {
+        if (path === 'vcluster/guide.mdx' && ref === 'merge-sha') {
+          return Promise.resolve({ data: { content: Buffer.from('new guide').toString('base64') } });
+        }
+        if (path.includes('version-0.27.0')) {
+          return Promise.reject(new Error('failed to read v0.27 target'));
+        }
+        if (path.includes('version-0.28.0')) {
+          return Promise.reject({ status: 404 });
+        }
+        throw new Error(`unexpected getContent call: ${path}@${ref}`);
+      });
+      const mockOctokit = {
+        paginate: jest.fn().mockResolvedValue([
+          { filename: 'vcluster/guide.mdx', status: 'added' }
+        ]),
+        rest: {
+          repos: {
+            getCommit,
+            getContent,
+            get: jest.fn().mockResolvedValue({ data: { default_branch: 'main' } }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          },
+          pulls: {
+            listFiles: jest.fn(),
+            list: jest.fn().mockResolvedValue({ data: [] }),
+            create: jest.fn().mockResolvedValue({ data: { number: 456 } })
+          },
+          git: {
+            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'main-sha' } } }),
+            createRef: jest.fn().mockResolvedValue({})
+          },
+          issues: {
+            addLabels: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      mockGithub.context = {
+        payload: {
+          action: 'closed',
+          pull_request: {
+            number: 123,
+            merged: true,
+            merge_commit_sha: 'merge-sha',
+            commits: 1,
+            labels: [{ name: 'backport-v0.27' }, { name: 'backport-v0.28' }],
+            title: 'Update guide'
+          },
+          repository: { default_branch: 'main' }
+        },
+        repo: { owner: 'test', repo: 'test-repo' }
+      };
+
+      await index.run();
+
+      expect(getCommit).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: '[v0.28] Update guide (#123)' })
+      );
+      expect(mockCore.setFailed).toHaveBeenCalledWith(
+        expect.stringContaining('Backport for v0.27 failed')
+      );
+    });
   });
 
   describe('backportFiles SHA conflict handling', () => {
     beforeEach(() => {
       jest.clearAllMocks();
+    });
+
+    it('fails closed when merge_commit_sha is missing', async () => {
+      await expect(index.backportFiles(
+        { rest: { repos: {} } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: {} } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'modified' }],
+        'backport/branch'
+      )).rejects.toThrow('missing merge_commit_sha');
     });
 
     it('logs error when SHA conflict retry also fails', async () => {
@@ -314,7 +395,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/test.mdx', status: 'added' }],
@@ -404,7 +485,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/test.mdx', status: 'added' }],
@@ -439,7 +520,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/test.mdx', status: 'added' }],
@@ -574,7 +655,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/removed.mdx', status: 'removed' }],
@@ -599,7 +680,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/gone.mdx', status: 'removed' }],
@@ -621,13 +702,26 @@ describe('Docs Backport Action Tests', () => {
       const mockOctokit = {
         rest: {
           repos: {
-            getContent: jest.fn()
-              // 1st call: get source content for the new filename
-              .mockResolvedValueOnce({ data: { content: Buffer.from('new content').toString('base64'), sha: 'src' } })
-              // 2nd call: check if new target exists (404 = doesn't exist yet)
-              .mockRejectedValueOnce({ status: 404 })
-              // 3rd call: check if old target exists for deletion
-              .mockResolvedValueOnce({ data: { sha: 'old-target-sha' } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/new-name.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from('new content').toString('base64'), sha: 'src' } });
+              }
+              if (path === 'vcluster/new-name.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from('old content').toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/new-name.mdx') {
+                return Promise.reject({ status: 404 });
+              }
+              if (path === 'vcluster/old-name.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from('old content').toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/old-name.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from('old content').toString('base64'), sha: 'old-target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
             createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({}),
             deleteFile: jest.fn().mockResolvedValueOnce({})
           }
@@ -636,7 +730,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{
@@ -644,7 +738,8 @@ describe('Docs Backport Action Tests', () => {
           previous_filename: 'vcluster/old-name.mdx',
           status: 'renamed'
         }],
-        'backport/branch'
+        'backport/branch',
+        'base-sha'
       );
 
       expect(stats.copied).toBe(1);
@@ -672,7 +767,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' } } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { head: { sha: 'sha' }, merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{
@@ -680,7 +775,8 @@ describe('Docs Backport Action Tests', () => {
           previous_filename: 'vcluster/old-name.mdx',
           status: 'renamed'
         }],
-        'backport/branch'
+        'backport/branch',
+        'base-sha'
       );
 
       expect(stats.copied).toBe(1);
@@ -720,7 +816,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: {} } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{
@@ -753,7 +849,7 @@ describe('Docs Backport Action Tests', () => {
 
       const stats = await index.backportFiles(
         mockOctokit,
-        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: {} } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{
@@ -1414,8 +1510,8 @@ describe('Docs Backport Action Tests', () => {
 
       expect(stats.copied).toBe(1);
       expect(stats.conflicts).toBe(0);
-      // getCommit was called once to resolve the shared pre-merge base, not once per file
-      expect(mockOctokit.rest.repos.getCommit).toHaveBeenCalledTimes(1);
+      // Added files need no before-image, so baseline resolution is skipped.
+      expect(mockOctokit.rest.repos.getCommit).not.toHaveBeenCalled();
     });
 
     it('preserves binary bytes when directly copying an added file', async () => {
@@ -1642,6 +1738,100 @@ describe('Docs Backport Action Tests', () => {
       expect(retryText).toContain('concurrent section');
     });
 
+    it('treats GitHub changed status as a modified file', async () => {
+      const versioned = `${base}version-only section\n`;
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/test.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(afterPRChange).toString('base64') } });
+              }
+              if (path === 'vcluster/test.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(base).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/test.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(versioned).toString('base64'), sha: 'target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'changed' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      const written = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
+      const writtenText = Buffer.from(written, 'base64').toString('utf-8');
+      expect(writtenText).toContain('line TWO CHANGED');
+      expect(writtenText).toContain('version-only section');
+    });
+
+    it('patches a copied file while retaining the old versioned path', async () => {
+      const oldVersioned = `${base}version-only section\n`;
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/copied.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(afterPRChange).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/copied.mdx') {
+                return Promise.reject({ status: 404 });
+              }
+              if (path === 'vcluster/original.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(base).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/original.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(oldVersioned).toString('base64'), sha: 'old-target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({}),
+            deleteFile: jest.fn()
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{
+          filename: 'vcluster/copied.mdx',
+          previous_filename: 'vcluster/original.mdx',
+          status: 'copied'
+        }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.deleted).toBe(0);
+      expect(stats.conflicts).toBe(0);
+      expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+      const written = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0].content;
+      const writtenText = Buffer.from(written, 'base64').toString('utf-8');
+      expect(writtenText).toContain('line TWO CHANGED');
+      expect(writtenText).toContain('version-only section');
+    });
+
     it('patches a rename onto the old versioned file before deleting the old path', async () => {
       const oldSource = 'line one\nline two\nline three\n';
       const renamedSource = 'line one\nline TWO CHANGED\nline three\n';
@@ -1748,6 +1938,79 @@ describe('Docs Backport Action Tests', () => {
       expect(stats.copied).toBe(0);
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
+    });
+
+    it('finishes a rename when a concurrent writer created the expected destination', async () => {
+      const conflict = Object.assign(new Error('Conflict'), { status: 409 });
+      let destinationReads = 0;
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              if (path === 'vcluster/new-name.mdx' && ref === 'merge-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(afterPRChange).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/new-name.mdx') {
+                destinationReads++;
+                return destinationReads === 1
+                  ? Promise.reject({ status: 404 })
+                  : Promise.resolve({
+                    data: { content: Buffer.from(afterPRChange).toString('base64'), sha: 'concurrent-sha' }
+                  });
+              }
+              if (path === 'vcluster/old-name.mdx' && ref === 'base-sha') {
+                return Promise.resolve({ data: { content: Buffer.from(base).toString('base64') } });
+              }
+              if (path === 'vcluster_versioned_docs/version-0.27.0/old-name.mdx') {
+                return Promise.resolve({
+                  data: { content: Buffer.from(base).toString('base64'), sha: 'old-target-sha' }
+                });
+              }
+              throw new Error(`unexpected getContent call: ${path}@${ref}`);
+            }),
+            createOrUpdateFileContents: jest.fn().mockRejectedValueOnce(conflict),
+            deleteFile: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{
+          filename: 'vcluster/new-name.mdx',
+          previous_filename: 'vcluster/old-name.mdx',
+          status: 'renamed'
+        }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.deleted).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.repos.deleteFile).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.27.0/old-name.mdx' })
+      );
+    });
+
+    it('fails an unknown GitHub file status closed', async () => {
+      const createOrUpdateFileContents = jest.fn();
+      const stats = await index.backportFiles(
+        { rest: { repos: { createOrUpdateFileContents } } },
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/test.mdx', status: 'unexpected' }],
+        'backport/branch'
+      );
+
+      expect(stats.errors).toBe(1);
+      expect(stats.copied).toBe(0);
+      expect(createOrUpdateFileContents).not.toHaveBeenCalled();
     });
   });
 
