@@ -2014,18 +2014,183 @@ describe('Docs Backport Action Tests', () => {
     });
   });
 
+  describe('run() conflict and failure outputs', () => {
+    const COMMENT_URL = 'https://github.com/test/test-repo/pull/123#issuecomment-1';
+    let mockCore: any;
+    let mockGithub: any;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockCore = require('@actions/core');
+      mockGithub = require('@actions/github');
+      mockCore.getInput.mockReturnValue('fake-token');
+    });
+
+    // The PR adds vcluster/guide.mdx. An added file conflicts when its target
+    // already exists in the version, and a target read that rejects with a
+    // non-404 error fails that version outright.
+    const buildOctokit = ({ existing = [] as string[], broken = [] as string[] } = {}) => {
+      const getContent = jest.fn().mockImplementation(({ path, ref }: any) => {
+        if (path === 'vcluster/guide.mdx' && ref === 'merge-sha') {
+          return Promise.resolve({ data: { content: Buffer.from('new guide').toString('base64') } });
+        }
+        if (broken.some(folder => path.includes(folder))) {
+          return Promise.reject(new Error('failed to read target'));
+        }
+        if (existing.some(folder => path.includes(folder))) {
+          return Promise.resolve({ data: { content: Buffer.from('version guide').toString('base64'), sha: 'tgt' } });
+        }
+        return Promise.reject({ status: 404 });
+      });
+      return {
+        paginate: jest.fn().mockResolvedValue([{ filename: 'vcluster/guide.mdx', status: 'added' }]),
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-before-pr' }] } }),
+            getContent,
+            get: jest.fn().mockResolvedValue({ data: { default_branch: 'main' } }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          },
+          pulls: {
+            list: jest.fn().mockResolvedValue({ data: [] }),
+            create: jest.fn().mockResolvedValue({ data: { number: 456 } })
+          },
+          git: {
+            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'main-sha' } } }),
+            createRef: jest.fn().mockResolvedValue({})
+          },
+          issues: {
+            addLabels: jest.fn().mockResolvedValue({}),
+            createComment: jest.fn().mockResolvedValue({ data: { html_url: COMMENT_URL } })
+          }
+        }
+      };
+    };
+
+    const setContext = (labels: string[], event: any = { action: 'closed' }) => {
+      mockGithub.context = {
+        payload: {
+          ...event,
+          pull_request: {
+            number: 123,
+            merged: true,
+            merge_commit_sha: 'merge-sha',
+            commits: 1,
+            labels: labels.map(name => ({ name })),
+            title: 'Update guide'
+          },
+          repository: { default_branch: 'main' }
+        },
+        repo: { owner: 'test', repo: 'test-repo' }
+      };
+    };
+
+    const outputs = (): Record<string, string> => Object.fromEntries(mockCore.setOutput.mock.calls);
+
+    it('publishes the conflicting files and comment URL while the run stays green', async () => {
+      const mockOctokit = buildOctokit({ existing: ['version-0.37.0'] });
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+
+      const target = 'vcluster_versioned_docs/version-0.37.0/guide.mdx';
+      expect(JSON.parse(outputs().conflicts)).toEqual([
+        { folder: 'vcluster', version: '0.37', files: [target], comment_url: COMMENT_URL }
+      ]);
+      expect(outputs().summary).toBe(
+        `vcluster v0.37: 1 file(s) need a manual backport. Details: ${COMMENT_URL}\n- \`${target}\``
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('leaves both outputs empty for a clean backport', async () => {
+      const mockOctokit = buildOctokit();
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
+      expect(outputs()).toEqual({ conflicts: '', summary: '' });
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('leaves both outputs empty when the run is skipped', async () => {
+      mockGithub.getOctokit = jest.fn().mockReturnValue(buildOctokit());
+      setContext(['documentation'], { action: 'labeled', label: { name: 'documentation' } });
+
+      await index.run();
+
+      expect(outputs()).toEqual({ conflicts: '', summary: '' });
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('reports conflicts in one version alongside the failure of another', async () => {
+      const mockOctokit = buildOctokit({ existing: ['version-0.37.0'], broken: ['version-0.38.0'] });
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37', 'backport-v0.38']);
+
+      await index.run();
+
+      expect(JSON.parse(outputs().conflicts)).toEqual([
+        expect.objectContaining({ version: '0.37', comment_url: COMMENT_URL })
+      ]);
+      expect(outputs().summary).toContain('vcluster v0.37: 1 file(s) need a manual backport.');
+      expect(outputs().summary).toContain('Backport for v0.38 failed: Backport to vcluster v0.38 failed for 1 file(s)');
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('Backport for v0.38 failed'));
+    });
+
+    it('still reports the conflict when the comment cannot be posted', async () => {
+      const mockOctokit = buildOctokit({ existing: ['version-0.37.0'] });
+      mockOctokit.rest.issues.createComment.mockRejectedValue(new Error('comment API down'));
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+
+      expect(JSON.parse(outputs().conflicts)).toEqual([
+        expect.objectContaining({ version: '0.37', comment_url: null })
+      ]);
+      expect(outputs().summary).not.toContain('Details:');
+      expect(outputs().summary).toContain('Backport for v0.37 failed: comment API down');
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('comment API down'));
+    });
+  });
+
+  describe('formatBackportSummary', () => {
+    it('is empty when nothing needs attention', () => {
+      expect(index.formatBackportSummary([], [])).toBe('');
+    });
+
+    it('lists each conflict before the failures', () => {
+      const summary = index.formatBackportSummary(
+        [{ folder: 'platform', version: '4.11', files: ['a.mdx', 'b.mdx'], comment_url: null }],
+        ['Backport for v4.12 failed: boom']
+      );
+      expect(summary).toBe(
+        'platform v4.11: 2 file(s) need a manual backport.\n- `a.mdx`\n- `b.mdx`\n' +
+        'Backport for v4.12 failed: boom'
+      );
+    });
+  });
+
   describe('postConflictComment', () => {
-    it('posts a comment listing every conflicting file', async () => {
+    it('posts a comment listing every conflicting file and returns its URL', async () => {
       const mockOctokit = {
         rest: {
           issues: {
-            createComment: jest.fn().mockResolvedValue({})
+            createComment: jest.fn().mockResolvedValue({
+              data: { html_url: 'https://github.com/test/test/pull/123#issuecomment-9' }
+            })
           }
         }
       };
       const mockContext = { repo: { owner: 'test', repo: 'test' } };
 
-      await index.postConflictComment(
+      const url = await index.postConflictComment(
         mockOctokit,
         mockContext,
         123,
@@ -2040,6 +2205,19 @@ describe('Docs Backport Action Tests', () => {
           body: expect.stringContaining('platform-annotations.mdx')
         })
       );
+      expect(url).toBe('https://github.com/test/test/pull/123#issuecomment-9');
+    });
+
+    it('returns null when GitHub reports no comment URL', async () => {
+      const mockOctokit = {
+        rest: { issues: { createComment: jest.fn().mockResolvedValue({}) } }
+      };
+
+      const url = await index.postConflictComment(
+        mockOctokit, { repo: { owner: 'test', repo: 'test' } }, 123, 'platform', '4.11', ['a.mdx']
+      );
+
+      expect(url).toBeNull();
     });
   });
 

@@ -8,6 +8,12 @@ inputs:
     required: true
     default: ${{ github.token }}
 
+outputs:
+  conflicts:
+    description: 'JSON array with one entry per version whose files could not be merged and were left unchanged: {"folder", "version", "files", "comment_url"}. Empty when every file applied cleanly.'
+  summary:
+    description: 'Plain-text lines naming each version that needs a person: its conflicting files and conflict comment URL, or why its backport failed. Empty when nothing needs attention.'
+
 runs:
   using: 'node20'
   main: 'dist/index.js'
