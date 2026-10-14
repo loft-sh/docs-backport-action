@@ -29962,6 +29962,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.fileTouchesSourceFolder = fileTouchesSourceFolder;
+exports.formatBackportSummary = formatBackportSummary;
 exports.run = run;
 exports.listChangedFiles = listChangedFiles;
 exports.deleteVersionedFile = deleteVersionedFile;
@@ -29989,8 +29990,30 @@ function fileTouchesSourceFolder(file, sourceFolder) {
     return file.filename.startsWith(`${sourceFolder}/`) ||
         (file.status === 'renamed' && file.previous_filename?.startsWith(`${sourceFolder}/`));
 }
+// Plain-text lines for every version that needs a person: files left
+// unchanged by a conflict, and versions whose backport failed outright.
+// Exported for testing
+function formatBackportSummary(reports, versionErrors) {
+    const lines = [];
+    for (const report of reports) {
+        const comment = report.comment_url ? ` Details: ${report.comment_url}` : '';
+        lines.push(`${report.folder} v${report.version}: ${report.files.length} file(s) need a manual backport.${comment}`);
+        lines.push(...report.files.map(f => `- \`${f}\``));
+    }
+    lines.push(...versionErrors);
+    return lines.join('\n');
+}
+// The original PR is already merged, so a conflict comment on it reaches
+// almost no one and a conflicted run still ends green. These outputs let the
+// calling workflow alert someone. Both are empty when nothing needs attention.
+function setBackportOutputs(reports, versionErrors) {
+    core.setOutput('conflicts', reports.length > 0 ? JSON.stringify(reports) : '');
+    core.setOutput('summary', formatBackportSummary(reports, versionErrors));
+}
 // Main function, exported for testing
 async function run() {
+    const conflictReports = [];
+    const versionErrors = [];
     try {
         // Get inputs
         const token = core.getInput('github_token', { required: true });
@@ -30057,7 +30080,6 @@ async function run() {
         // irrelevant backport does not perform commit-history work, then reuse
         // the same promise for every requested version.
         let preMergeBaseShaPromise = null;
-        const versionErrors = [];
         // Process each version label
         for (const version of versionLabels) {
             try {
@@ -30121,8 +30143,17 @@ async function run() {
                 // Conflicts need a human regardless of whether a backport PR got
                 // created (an all-conflicts backport has nothing to open a PR with,
                 // since nothing was actually committed to the branch).
+                // Record the conflict before commenting, so a failed comment still
+                // reaches the outputs.
                 if (stats.conflictFiles.length > 0) {
-                    await postConflictComment(octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles);
+                    const report = {
+                        folder: targetMainFolder,
+                        version,
+                        files: stats.conflictFiles,
+                        comment_url: null
+                    };
+                    conflictReports.push(report);
+                    report.comment_url = await postConflictComment(octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles);
                 }
             }
             catch (error) {
@@ -30138,6 +30169,9 @@ async function run() {
     }
     catch (error) {
         core.setFailed(`Action failed: ${error.message}`);
+    }
+    finally {
+        setBackportOutputs(conflictReports, versionErrors);
     }
 }
 // Fetch every changed file in the PR, following pagination.
@@ -30772,18 +30806,20 @@ async function createBackportPR(octokit, context, branchName, mainFolder, versio
 }
 // Surface merge conflicts on the original PR even when no backport PR could
 // be opened (e.g. every changed file conflicted, leaving nothing to commit).
+// Returns the comment URL, or null when GitHub does not report one.
 // Exported for testing
 async function postConflictComment(octokit, context, originalPRNumber, mainFolder, version, conflictFiles) {
     const body = `The automated backport of this PR to \`${mainFolder}\` v${version} could not merge the ` +
         `following files, because their content in that version has diverged from what this PR changed. ` +
         `They were left unchanged; please backport the relevant changes by hand:\n\n` +
         conflictFiles.map(f => `- \`${f}\``).join('\n');
-    await octokit.rest.issues.createComment({
+    const { data: comment } = await octokit.rest.issues.createComment({
         ...context.repo,
         issue_number: originalPRNumber,
         body
     });
     core.info(`Posted conflict comment on PR #${originalPRNumber} for ${mainFolder} v${version}`);
+    return comment?.html_url ?? null;
 }
 run();
 

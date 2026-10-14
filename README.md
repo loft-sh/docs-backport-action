@@ -38,6 +38,29 @@ jobs:
 
 - `github_token`: GitHub token to authenticate API requests (required)
 
+## Outputs
+
+A file whose versioned copy has diverged from what the PR changed is left unchanged and reported as a conflict. Conflicts get a comment on the original PR, but the run still succeeds, so use these outputs to alert someone:
+
+- `conflicts`: JSON array with one entry per version that has conflicts, for example `[{"folder":"vcluster","version":"0.37","files":["vcluster_versioned_docs/version-0.37.0/guide.mdx"],"comment_url":"https://github.com/..."}]`. Empty when every file applied cleanly.
+- `summary`: plain-text lines naming each version that needs a person: its conflicting files and the comment URL, or why its backport failed. Empty when nothing needs attention.
+
+Both outputs are set on failed runs too, so a notification step can report what was done before the failure:
+
+```yaml
+      - name: Backport Docusaurus Changes
+        id: backport
+        uses: loft-sh/docs-backport-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify on conflicts or failure
+        if: failure() || steps.backport.outputs.conflicts != ''
+        run: echo "$SUMMARY"
+        env:
+          SUMMARY: ${{ steps.backport.outputs.summary }}
+```
+
 ## Labels
 
 Add labels to PRs to specify which version(s) to backport to:
