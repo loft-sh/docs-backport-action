@@ -608,6 +608,29 @@ async function getFileAtRef(octokit: any, context: any, path: string, ref: strin
   }
 }
 
+function posixDirname(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash === -1 ? '.' : path.substring(0, slash);
+}
+
+// True when a directory exists at the given ref. The Contents API returns an
+// array for a directory and 404 for a missing path.
+async function directoryExistsAtRef(octokit: any, context: any, path: string, ref: string): Promise<boolean> {
+  try {
+    const { data } = await octokit.rest.repos.getContent({
+      ...context.repo,
+      path,
+      ref
+    });
+    return Array.isArray(data);
+  } catch (error: any) {
+    if (error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 // Exported for testing
 export async function backportFiles(
   octokit: any,
@@ -716,8 +739,19 @@ export async function backportFiles(
       // Check if the target file already exists, and fetch its content so we
       // can attempt a patch merge instead of a blind overwrite.
       const existingTargetFile = await getFileAtRef(octokit, context, targetPath, branchName);
-      if (!existingTargetFile) {
-        core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
+
+      // A modified file that this version lacks at the same path usually lives
+      // at a different path here, because the docs were restructured after the
+      // version was cut. Writing the full post-image would publish a second
+      // copy of the page, so leave it for a person to place.
+      if (effectiveStatus === 'modified' && !existingTargetFile) {
+        core.warning(
+          `Target path ${targetPath} does not exist in this version; the page may live at a different path. ` +
+          `Leaving it for manual review.`
+        );
+        conflicts++;
+        conflictFiles.push(targetPath);
+        continue;
       }
 
       // Reusing an existing destination for an add or rename is ambiguous: it
@@ -738,12 +772,41 @@ export async function backportFiles(
         const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
         const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
         patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchName);
+        // Neither the old nor the new path exists in this version, so the page
+        // is at some other path here, or the version never had it.
+        if (!patchTargetFile) {
+          core.warning(
+            `Neither ${oldTargetPath} nor ${targetPath} exists in this version; the page may live at a ` +
+            `different path. Leaving it for manual review.`
+          );
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+      }
+
+      // A new file whose parent folder this version lacks belongs to a folder
+      // layout the version doesn't have. Creating it would add a new sidebar
+      // section to the old version, so leave it for a person to place.
+      if (effectiveStatus === 'added') {
+        const relativeDir = posixDirname(relativePath);
+        if (relativeDir !== '.' &&
+          !(await directoryExistsAtRef(octokit, context, `${versionedFolder}/${relativeDir}`, branchName))) {
+          core.warning(
+            `Folder ${versionedFolder}/${relativeDir} does not exist in this version, so ${targetPath} has no ` +
+            `matching place in its layout. Leaving it for manual review.`
+          );
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+        core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
       }
 
       // Modified and renamed files may have independent version-specific
       // history. Apply only this PR's before/after diff to that current text.
-      // Added files, and files this version has never had, have no prior state
-      // to protect, so preserve and copy their original bytes directly.
+      // Added files have no prior state to protect, so preserve and copy their
+      // original bytes directly.
       let finalContent = afterBase64;
       let isMerge = false;
       let patchTexts: { before: string; after: string } | null = null;
@@ -1012,9 +1075,10 @@ export async function createBackportPR(
 
   let body = `This PR backports changes from ${mainFolder} to version v${version}.\n\nOriginal PR: #${originalPRNumber}`;
   if (conflictFiles.length > 0) {
-    body += `\n\n## Manual review needed\n\nThe following files could not be merged automatically because their ` +
-      `content in this version has diverged from what the original PR changed. They were left unchanged here; ` +
-      `please backport the relevant changes by hand:\n\n${conflictFiles.map(f => `- \`${f}\``).join('\n')}`;
+    body += `\n\n## Manual review needed\n\nThe following files could not be merged automatically. Either their ` +
+      `content in this version has diverged from what the original PR changed, or this version has no file or ` +
+      `folder at the same path, often because the docs were restructured after this version. They were left ` +
+      `unchanged here; please backport the relevant changes by hand, at this version's own path:\n\n${conflictFiles.map(f => `- \`${f}\``).join('\n')}`;
   }
 
   // Create a PR
@@ -1049,8 +1113,9 @@ export async function postConflictComment(
   conflictFiles: string[]
 ): Promise<string | null> {
   const body = `The automated backport of this PR to \`${mainFolder}\` v${version} could not merge the ` +
-    `following files, because their content in that version has diverged from what this PR changed. ` +
-    `They were left unchanged; please backport the relevant changes by hand:\n\n` +
+    `following files. Either their content in that version has diverged from what this PR changed, or that ` +
+    `version has no file or folder at the same path, often because the docs were restructured after that ` +
+    `version. They were left unchanged; please backport the relevant changes by hand, at that version's own path:\n\n` +
     conflictFiles.map(f => `- \`${f}\``).join('\n');
 
   const { data: comment } = await octokit.rest.issues.createComment({

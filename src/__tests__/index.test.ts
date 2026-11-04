@@ -751,7 +751,7 @@ describe('Docs Backport Action Tests', () => {
       );
     });
 
-    it('copies new path even when old path already absent', async () => {
+    it('reports a conflict when neither the old nor the new path exists in the version', async () => {
       const mockOctokit = {
         rest: {
           repos: {
@@ -779,8 +779,11 @@ describe('Docs Backport Action Tests', () => {
         'base-sha'
       );
 
-      expect(stats.copied).toBe(1);
+      expect(stats.copied).toBe(0);
       expect(stats.deleted).toBe(0);
+      expect(stats.conflicts).toBe(1);
+      expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/new-name.mdx']);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.repos.deleteFile).not.toHaveBeenCalled();
     });
 
@@ -919,12 +922,17 @@ describe('Docs Backport Action Tests', () => {
           pulls: { listFiles },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
-            getContent: jest.fn().mockImplementation(({ path }: any) =>
-              path.startsWith('vcluster_versioned_docs/')
-                ? Promise.reject({ status: 404 }) // target file not there yet
-                : Promise.resolve({
-                    data: { content: Buffer.from('content').toString('base64'), sha: 'src' }
-                  })
+            // Every versioned copy still matches the pre-merge base, so each
+            // file takes the clean direct-copy path.
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) =>
+              Promise.resolve({
+                data: {
+                  content: Buffer.from(
+                    path.startsWith('vcluster_versioned_docs/') || ref === 'base-sha' ? 'old' : 'content'
+                  ).toString('base64'),
+                  sha: path.startsWith('vcluster_versioned_docs/') ? 'target' : 'src'
+                }
+              })
             ),
             createOrUpdateFileContents: jest.fn().mockResolvedValue({})
           }
@@ -1512,6 +1520,101 @@ describe('Docs Backport Action Tests', () => {
       expect(stats.conflicts).toBe(0);
       // Added files need no before-image, so baseline resolution is skipped.
       expect(mockOctokit.rest.repos.getCommit).not.toHaveBeenCalled();
+    });
+
+    it('reports a conflict instead of creating a modified file the version lacks at the same path', async () => {
+      // After a docs restructure, the version holds the page at its old path.
+      // Creating the new path would publish a duplicate page in that version.
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
+            getContent: jest.fn().mockImplementation(({ path }: any) =>
+              path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 })
+                : Promise.resolve({ data: { content: Buffer.from('updated').toString('base64') } })
+            ),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/configure/lifecycle/sleep.mdx', status: 'modified' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(0);
+      expect(stats.errors).toBe(0);
+      expect(stats.conflicts).toBe(1);
+      expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/configure/lifecycle/sleep.mdx']);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+    });
+
+    it('reports a conflict for an added file whose folder the version lacks', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockImplementation(({ path }: any) =>
+              path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 })
+                : Promise.resolve({ data: { content: Buffer.from('new').toString('base64') } })
+            ),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/configure/lifecycle/new-page.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(0);
+      expect(stats.conflicts).toBe(1);
+      expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/configure/lifecycle/new-page.mdx']);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+    });
+
+    it('creates an added file when its folder exists in the version', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockImplementation(({ path }: any) => {
+              if (path === 'vcluster_versioned_docs/version-0.27.0/configure') {
+                return Promise.resolve({ data: [{ type: 'file', path: `${path}/existing.mdx` }] });
+              }
+              return path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 })
+                : Promise.resolve({ data: { content: Buffer.from('new').toString('base64') } });
+            }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/configure/new-page.mdx', status: 'added' }],
+        'backport/branch'
+      );
+
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.27.0/configure/new-page.mdx' })
+      );
     });
 
     it('preserves binary bytes when directly copying an added file', async () => {
