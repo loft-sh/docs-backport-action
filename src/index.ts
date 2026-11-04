@@ -199,7 +199,7 @@ export async function run(): Promise<void> {
       const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
       
       // Create the branch
-      await createBranchForBackport(octokit, context, branchName);
+      const branchBaseSha = await createBranchForBackport(octokit, context, branchName);
       
       // Process files and get stats
       const stats = await backportFiles(
@@ -209,7 +209,8 @@ export async function run(): Promise<void> {
         versionedFolder, 
         changedFiles, 
         branchName,
-        preMergeBaseSha
+        preMergeBaseSha,
+        branchBaseSha
       );
 
       // Never open a normal-looking PR when one or more files failed to
@@ -305,7 +306,7 @@ async function createBranchForBackport(
   octokit: any,
   context: any,
   branchName: string
-): Promise<void> {
+): Promise<string> {
   // Get the default branch
   const { data: repo } = await octokit.rest.repos.get({
     ...context.repo
@@ -327,6 +328,7 @@ async function createBranchForBackport(
   });
   
   core.info(`Created branch ${branchName}`);
+  return ref.object.sha;
 }
 
 // Interface for backport statistics
@@ -608,6 +610,14 @@ async function getFileAtRef(octokit: any, context: any, path: string, ref: strin
   }
 }
 
+async function getBranchHeadSha(octokit: any, context: any, branchName: string): Promise<string> {
+  const { data: ref } = await octokit.rest.git.getRef({
+    ...context.repo,
+    ref: `heads/${branchName}`
+  });
+  return ref.object.sha;
+}
+
 function posixDirname(path: string): string {
   const slash = path.lastIndexOf('/');
   return slash === -1 ? '.' : path.substring(0, slash);
@@ -639,7 +649,8 @@ export async function backportFiles(
   versionedFolder: string,
   files: any[],
   branchName: string,
-  resolvedPreMergeBaseSha?: string
+  resolvedPreMergeBaseSha?: string,
+  branchBaseSha?: string
 ): Promise<BackportStats> {
   // Track stats for reporting
   let copied = 0;
@@ -664,6 +675,19 @@ export async function backportFiles(
       file.previous_filename?.startsWith(`${sourceFolder}/`)));
   const preMergeBaseSha = resolvedPreMergeBaseSha ||
     (needsPatchBaseline ? await getPreMergeBaseSha(octokit, context, mergeCommitSha) : null);
+
+  // Folder checks for added files read the version's layout as it was when
+  // the backport branch was created. Reading the live branch would see this
+  // run's own earlier deletions, so a replacement file in a folder whose last
+  // file this PR deletes would wrongly look like it has no folder. Resolve the
+  // commit before the loop writes anything.
+  const needsLayoutRef = files.some(file =>
+    file.filename.startsWith(`${sourceFolder}/`) &&
+    (file.status === 'added' ||
+      ((file.status === 'renamed' || file.status === 'copied') &&
+        !file.previous_filename?.startsWith(`${sourceFolder}/`))));
+  const layoutRef = branchBaseSha ||
+    (needsLayoutRef ? await getBranchHeadSha(octokit, context, branchName) : branchName);
 
   for (const file of files) {
     try {
@@ -788,12 +812,14 @@ export async function backportFiles(
       // A new file whose parent folder this version lacks belongs to a folder
       // layout the version doesn't have. Creating it would add a new sidebar
       // section to the old version, so leave it for a person to place.
+      // A root-level file checks the version folder itself, so a missing
+      // version is reported rather than created.
       if (effectiveStatus === 'added') {
         const relativeDir = posixDirname(relativePath);
-        if (relativeDir !== '.' &&
-          !(await directoryExistsAtRef(octokit, context, `${versionedFolder}/${relativeDir}`, branchName))) {
+        const targetDir = relativeDir === '.' ? versionedFolder : `${versionedFolder}/${relativeDir}`;
+        if (!(await directoryExistsAtRef(octokit, context, targetDir, layoutRef))) {
           core.warning(
-            `Folder ${versionedFolder}/${relativeDir} does not exist in this version, so ${targetPath} has no ` +
+            `Folder ${targetDir} does not exist in this version, so ${targetPath} has no ` +
             `matching place in its layout. Leaving it for manual review.`
           );
           conflicts++;

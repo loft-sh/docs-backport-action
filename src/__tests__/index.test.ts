@@ -303,6 +303,9 @@ describe('Docs Backport Action Tests', () => {
         if (path.includes('version-0.27.0')) {
           return Promise.reject(new Error('failed to read v0.27 target'));
         }
+        if (path === 'vcluster_versioned_docs/version-0.28.0') {
+          return Promise.resolve({ data: [] }); // version folder exists
+        }
         if (path.includes('version-0.28.0')) {
           return Promise.reject({ status: 404 });
         }
@@ -382,10 +385,12 @@ describe('Docs Backport Action Tests', () => {
     it('logs error when SHA conflict retry also fails', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }) // target folder exists
               .mockRejectedValueOnce(new Error('network error')), // retry getContent fails
             createOrUpdateFileContents: jest.fn()
               .mockRejectedValueOnce(new Error('is at abc but expected def'))
@@ -409,11 +414,13 @@ describe('Docs Backport Action Tests', () => {
     it('copies file when no conflict', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({})
           }
         }
@@ -439,11 +446,13 @@ describe('Docs Backport Action Tests', () => {
       // deletion that the merge silently restored.
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValueOnce({})
           }
         }
@@ -469,10 +478,12 @@ describe('Docs Backport Action Tests', () => {
     it('does not overwrite a concurrently created added file (message pattern)', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }) // target folder exists
               .mockResolvedValueOnce({
                 data: { content: Buffer.from('concurrent content').toString('base64'), sha: 'conflict-sha' }
               }),
@@ -504,10 +515,12 @@ describe('Docs Backport Action Tests', () => {
 
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('test').toString('base64'), sha: 'src' } })
               .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }) // target folder exists
               .mockResolvedValueOnce({
                 data: { content: Buffer.from('concurrent content').toString('base64'), sha: 'conflict-sha' }
               }),
@@ -840,10 +853,12 @@ describe('Docs Backport Action Tests', () => {
     it('treats a rename into the source folder as an addition', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('moved content').toString('base64') } })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValue({}),
             deleteFile: jest.fn()
           }
@@ -1497,11 +1512,13 @@ describe('Docs Backport Action Tests', () => {
     it('falls back to a direct copy for an added file with no prior state to protect', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: Buffer.from('brand new content').toString('base64') } })
-              .mockRejectedValueOnce({ status: 404 }), // no existing target file
+              .mockRejectedValueOnce({ status: 404 }) // no existing target file
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValue({})
           }
         }
@@ -1575,12 +1592,102 @@ describe('Docs Backport Action Tests', () => {
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/configure/lifecycle/new-page.mdx', status: 'added' }],
-        'backport/branch'
+        'backport/branch',
+        undefined,
+        'branch-base-sha'
       );
 
       expect(stats.copied).toBe(0);
       expect(stats.conflicts).toBe(1);
       expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/configure/lifecycle/new-page.mdx']);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+    });
+
+    it('checks folders against the branch base, not deletions made earlier in the same run', async () => {
+      // The PR deletes the folder's only file and adds a replacement there.
+      // The live backport branch loses the folder once the deletion lands, but
+      // the version did have it, so the replacement must still be created.
+      let deleted = false;
+      const mockOctokit = {
+        rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
+          repos: {
+            getContent: jest.fn().mockImplementation(({ path, ref }: any) => {
+              const folder = 'vcluster_versioned_docs/version-0.27.0/configure';
+              if (path === folder) {
+                return ref === 'branch-base-sha' || !deleted
+                  ? Promise.resolve({ data: [{ type: 'file', path: `${folder}/old.mdx` }] })
+                  : Promise.reject({ status: 404 });
+              }
+              if (path === `${folder}/old.mdx`) {
+                return deleted
+                  ? Promise.reject({ status: 404 })
+                  : Promise.resolve({ data: { content: Buffer.from('old').toString('base64'), sha: 'old-sha' } });
+              }
+              return path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 })
+                : Promise.resolve({ data: { content: Buffer.from('new').toString('base64') } });
+            }),
+            deleteFile: jest.fn().mockImplementation(() => { deleted = true; return Promise.resolve({}); }),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [
+          { filename: 'vcluster/configure/old.mdx', status: 'removed' },
+          { filename: 'vcluster/configure/new.mdx', status: 'added' }
+        ],
+        'backport/branch'
+      );
+
+      expect(stats.deleted).toBe(1);
+      expect(stats.copied).toBe(1);
+      expect(stats.conflicts).toBe(0);
+      expect(mockOctokit.rest.git.getRef).toHaveBeenCalledWith(
+        expect.objectContaining({ ref: 'heads/backport/branch' })
+      );
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.27.0/configure/new.mdx' })
+      );
+    });
+
+    it('reports a conflict for a root-level added file when the version folder is missing', async () => {
+      const mockOctokit = {
+        rest: {
+          repos: {
+            getContent: jest.fn().mockImplementation(({ path }: any) =>
+              path.startsWith('vcluster_versioned_docs/')
+                ? Promise.reject({ status: 404 })
+                : Promise.resolve({ data: { content: Buffer.from('new').toString('base64') } })
+            ),
+            createOrUpdateFileContents: jest.fn().mockResolvedValue({})
+          }
+        }
+      };
+
+      const stats = await index.backportFiles(
+        mockOctokit,
+        { repo: { owner: 'test', repo: 'test' }, payload: { pull_request: { merge_commit_sha: 'merge-sha' } } },
+        'vcluster',
+        'vcluster_versioned_docs/version-0.27.0',
+        [{ filename: 'vcluster/new-page.mdx', status: 'added' }],
+        'backport/branch',
+        undefined,
+        'branch-base-sha'
+      );
+
+      expect(stats.copied).toBe(0);
+      expect(stats.conflicts).toBe(1);
+      expect(stats.conflictFiles).toEqual(['vcluster_versioned_docs/version-0.27.0/new-page.mdx']);
+      expect(mockOctokit.rest.repos.getContent).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'vcluster_versioned_docs/version-0.27.0', ref: 'branch-base-sha' })
+      );
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
     });
 
@@ -1607,7 +1714,9 @@ describe('Docs Backport Action Tests', () => {
         'vcluster',
         'vcluster_versioned_docs/version-0.27.0',
         [{ filename: 'vcluster/configure/new-page.mdx', status: 'added' }],
-        'backport/branch'
+        'backport/branch',
+        undefined,
+        'branch-base-sha'
       );
 
       expect(stats.copied).toBe(1);
@@ -1621,11 +1730,13 @@ describe('Docs Backport Action Tests', () => {
       const binary = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x10]);
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({ data: { content: binary.toString('base64') } })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValue({})
           }
         }
@@ -1734,14 +1845,16 @@ describe('Docs Backport Action Tests', () => {
       });
       const mockOctokit = {
         rest: {
-          git: { getBlob },
+          git: {
+            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }), getBlob },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
               .mockResolvedValueOnce({
                 data: { content: '', encoding: 'none', size: 2_000_000, sha: 'large-blob-sha' }
               })
-              .mockRejectedValueOnce({ status: 404 }),
+              .mockRejectedValueOnce({ status: 404 })
+              .mockResolvedValueOnce({ data: [] }), // target folder exists
             createOrUpdateFileContents: jest.fn().mockResolvedValue({})
           }
         }
@@ -1765,6 +1878,7 @@ describe('Docs Backport Action Tests', () => {
     it('reports an added file as a conflict when its versioned target already exists', async () => {
       const mockOctokit = {
         rest: {
+          git: { getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'branch-base-sha' } } }) },
           repos: {
             getCommit: jest.fn().mockResolvedValue({ data: { parents: [{ sha: 'base-sha' }] } }),
             getContent: jest.fn()
@@ -2142,6 +2256,9 @@ describe('Docs Backport Action Tests', () => {
         }
         if (existing.some(folder => path.includes(folder))) {
           return Promise.resolve({ data: { content: Buffer.from('version guide').toString('base64'), sha: 'tgt' } });
+        }
+        if (/^vcluster_versioned_docs\/version-[^/]+$/.test(path)) {
+          return Promise.resolve({ data: [] }); // version folder exists
         }
         return Promise.reject({ status: 404 });
       });
