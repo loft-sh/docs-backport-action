@@ -29965,6 +29965,8 @@ exports.fileTouchesSourceFolder = fileTouchesSourceFolder;
 exports.formatBackportSummary = formatBackportSummary;
 exports.run = run;
 exports.listChangedFiles = listChangedFiles;
+exports.backportBranchName = backportBranchName;
+exports.backportBranchExists = backportBranchExists;
 exports.deleteVersionedFile = deleteVersionedFile;
 exports.backportFiles = backportFiles;
 exports.checkExistingBackportPR = checkExistingBackportPR;
@@ -29983,6 +29985,7 @@ const VERSION_LABEL_REGEX = /^backport-v([\d.]+)$/;
 // GitHub's pulls.listFiles endpoint returns 30 files per page by default and
 // serves at most 100 per page.
 const FILES_PER_PAGE = 100;
+const EXISTING_BACKPORT_PR_MAX_PAGES = 100;
 const SUPPORTED_FILE_STATUSES = new Set([
     'added', 'removed', 'modified', 'renamed', 'changed', 'copied', 'unchanged'
 ]);
@@ -30098,10 +30101,15 @@ async function run() {
                     core.info(`No files changed in ${targetMainFolder} for version ${version}, skipping`);
                     continue;
                 }
-                // Check if a backport PR already exists for this PR and version
+                // Check if a backport PR already exists for this PR and version.
                 const existingPR = await checkExistingBackportPR(octokit, context, targetMainFolder, version, prNumber);
                 if (existingPR) {
                     core.info(`Backport PR #${existingPR.number} already exists for ${targetMainFolder} to v${version}, skipping`);
+                    continue;
+                }
+                const branchName = backportBranchName(targetMainFolder, version, prNumber);
+                if (await backportBranchExists(octokit, context, branchName)) {
+                    core.info(`Backport branch ${branchName} already exists for PR #${prNumber}, skipping`);
                     continue;
                 }
                 // Construct the versioned folder path based on our folder structure
@@ -30116,11 +30124,11 @@ async function run() {
                     preMergeBaseShaPromise = getPreMergeBaseSha(octokit, context, mergeCommitSha);
                 }
                 const preMergeBaseSha = await preMergeBaseShaPromise;
-                // Create a branch for this backport
-                const timestamp = new Date().getTime();
-                const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
                 // Create the branch
                 const branchBaseSha = await createBranchForBackport(octokit, context, branchName);
+                if (!branchBaseSha) {
+                    continue;
+                }
                 // Process files and get stats
                 const stats = await backportFiles(octokit, context, targetMainFolder, versionedFolder, changedFiles, branchName, preMergeBaseSha, branchBaseSha);
                 // Never open a normal-looking PR when one or more files failed to
@@ -30199,13 +30207,48 @@ async function createBranchForBackport(octokit, context, branchName) {
         ref: `heads/${defaultBranch}`
     });
     // Create the new branch
-    await octokit.rest.git.createRef({
-        ...context.repo,
-        ref: `refs/heads/${branchName}`,
-        sha: ref.object.sha
-    });
+    try {
+        await octokit.rest.git.createRef({
+            ...context.repo,
+            ref: `refs/heads/${branchName}`,
+            sha: ref.object.sha
+        });
+    }
+    catch (error) {
+        if (error.status === 422) {
+            if (await backportBranchExists(octokit, context, branchName)) {
+                core.info(`Backport branch ${branchName} was created concurrently, skipping`);
+                return null;
+            }
+            throw new Error(`Backport branch ${branchName} creation failed with 422, but the branch does not exist`);
+        }
+        throw error;
+    }
     core.info(`Created branch ${branchName}`);
     return ref.object.sha;
+}
+// New branches encode the source PR and target, giving retries a stable key.
+// Older timestamp branches cannot be safely associated with a source PR.
+function backportBranchName(mainFolder, version, originalPRNumber) {
+    return `backport/${mainFolder}-to-${version}-pr-${originalPRNumber}`;
+}
+// A prior run can leave this branch without a PR (for example, when every
+// file conflicted). Treat it as completed work on replay. Only a 404 means
+// absent; API failures must stop before any branch or file writes.
+async function backportBranchExists(octokit, context, branchName) {
+    try {
+        await octokit.rest.git.getRef({
+            ...context.repo,
+            ref: `heads/${branchName}`
+        });
+        return true;
+    }
+    catch (error) {
+        if (error.status === 404) {
+            return false;
+        }
+        throw error;
+    }
 }
 // Decode a Contents API response body to UTF-8 text, regardless of whether
 // Octokit handed back a base64 string or an already-decoded buffer/array.
@@ -30822,36 +30865,49 @@ async function backportFiles(octokit, context, sourceFolder, versionedFolder, fi
 }
 // Exported for testing
 async function checkExistingBackportPR(octokit, context, mainFolder, version, originalPRNumber) {
-    try {
-        // Search for both open and closed PRs that mention the original PR number
-        const states = ['open', 'closed'];
-        for (const state of states) {
+    const defaultBranch = context.payload.repository?.default_branch;
+    if (typeof defaultBranch !== 'string' || defaultBranch.length === 0) {
+        throw new Error('Repository default branch is missing; refusing to match a backport PR');
+    }
+    // Search all open and closed PR pages. Closed includes merged PRs. A
+    // truncated first page can otherwise let a replay create another backport.
+    const states = ['open', 'closed'];
+    for (const state of states) {
+        let page = 1;
+        while (true) {
             const { data: prs } = await octokit.rest.pulls.list({
                 ...context.repo,
-                state: state,
+                state,
                 sort: 'created',
                 direction: 'desc',
-                per_page: 100
+                per_page: 100,
+                page
             });
-            // Look for PRs with the new title format or body referencing original PR
+            if (!Array.isArray(prs)) {
+                throw new Error(`GitHub returned an invalid ${state} pull request page`);
+            }
             for (const pr of prs) {
-                // Check for new title format: [vX.Y] original title (#PR_NUMBER)
+                if (pr.base?.ref !== defaultBranch) {
+                    continue;
+                }
                 const matchesNewTitleFormat = pr.title.includes(`[v${version}]`) && pr.title.includes(`(#${originalPRNumber})`);
-                // Also check legacy format for backward compatibility
                 const matchesLegacyTitle = pr.title.includes(`${mainFolder} changes to v${version}`);
                 const referencesOriginalPR = pr.body && pr.body.includes(`Original PR: #${originalPRNumber}`);
-                if ((matchesNewTitleFormat || (matchesLegacyTitle && referencesOriginalPR))) {
+                if (matchesNewTitleFormat || (matchesLegacyTitle && referencesOriginalPR)) {
                     core.info(`Found existing ${state} backport PR #${pr.number} for ${mainFolder} to v${version} from PR #${originalPRNumber}`);
                     return pr;
                 }
             }
+            if (prs.length < 100) {
+                break;
+            }
+            if (page >= EXISTING_BACKPORT_PR_MAX_PAGES) {
+                throw new Error(`Existing ${state} backport PR search exceeded ${EXISTING_BACKPORT_PR_MAX_PAGES} pages`);
+            }
+            page++;
         }
-        return null;
     }
-    catch (error) {
-        core.warning(`Error checking for existing backport PRs: ${error.message}`);
-        return null;
-    }
+    return null;
 }
 // Exported for testing
 async function createBackportPR(octokit, context, branchName, mainFolder, version, originalPRNumber, originalPRTitle, conflictFiles = []) {
