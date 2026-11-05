@@ -40,7 +40,7 @@ jobs:
 
 ## Outputs
 
-A file whose versioned copy has diverged from what the PR changed is left unchanged and reported as a conflict. Conflicts get a comment on the original PR, but the run still succeeds, so use these outputs to alert someone:
+A file whose versioned copy has diverged from what the PR changed is left unchanged and reported as a conflict. So is a file the version has no matching place for: a modified or renamed file that doesn't exist at the same path in the version, or an added file whose folder the version lacks. After a docs restructure, those pages live at different paths in older versions, and copying them by path would publish duplicate pages. Conflicts get a comment on the original PR, but the run still succeeds, so use these outputs to alert someone:
 
 - `conflicts`: JSON array with one entry per version that has conflicts, for example `[{"folder":"vcluster","version":"0.37","files":["vcluster_versioned_docs/version-0.37.0/guide.mdx"],"comment_url":"https://github.com/..."}]`. Empty when every file applied cleanly.
 - `summary`: plain-text lines naming each version that needs a person: its conflicting files and the comment URL, or why its backport failed. Empty when nothing needs attention.

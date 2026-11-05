@@ -199,7 +199,7 @@ export async function run(): Promise<void> {
       const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
       
       // Create the branch
-      await createBranchForBackport(octokit, context, branchName);
+      const branchBaseSha = await createBranchForBackport(octokit, context, branchName);
       
       // Process files and get stats
       const stats = await backportFiles(
@@ -209,7 +209,8 @@ export async function run(): Promise<void> {
         versionedFolder, 
         changedFiles, 
         branchName,
-        preMergeBaseSha
+        preMergeBaseSha,
+        branchBaseSha
       );
 
       // Never open a normal-looking PR when one or more files failed to
@@ -305,7 +306,7 @@ async function createBranchForBackport(
   octokit: any,
   context: any,
   branchName: string
-): Promise<void> {
+): Promise<string> {
   // Get the default branch
   const { data: repo } = await octokit.rest.repos.get({
     ...context.repo
@@ -327,6 +328,7 @@ async function createBranchForBackport(
   });
   
   core.info(`Created branch ${branchName}`);
+  return ref.object.sha;
 }
 
 // Interface for backport statistics
@@ -608,6 +610,37 @@ async function getFileAtRef(octokit: any, context: any, path: string, ref: strin
   }
 }
 
+async function getBranchHeadSha(octokit: any, context: any, branchName: string): Promise<string> {
+  const { data: ref } = await octokit.rest.git.getRef({
+    ...context.repo,
+    ref: `heads/${branchName}`
+  });
+  return ref.object.sha;
+}
+
+function posixDirname(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash === -1 ? '.' : path.substring(0, slash);
+}
+
+// True when a directory exists at the given ref. The Contents API returns an
+// array for a directory and 404 for a missing path.
+async function directoryExistsAtRef(octokit: any, context: any, path: string, ref: string): Promise<boolean> {
+  try {
+    const { data } = await octokit.rest.repos.getContent({
+      ...context.repo,
+      path,
+      ref
+    });
+    return Array.isArray(data);
+  } catch (error: any) {
+    if (error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 // Exported for testing
 export async function backportFiles(
   octokit: any,
@@ -616,7 +649,8 @@ export async function backportFiles(
   versionedFolder: string,
   files: any[],
   branchName: string,
-  resolvedPreMergeBaseSha?: string
+  resolvedPreMergeBaseSha?: string,
+  branchBaseSha?: string
 ): Promise<BackportStats> {
   // Track stats for reporting
   let copied = 0;
@@ -641,6 +675,19 @@ export async function backportFiles(
       file.previous_filename?.startsWith(`${sourceFolder}/`)));
   const preMergeBaseSha = resolvedPreMergeBaseSha ||
     (needsPatchBaseline ? await getPreMergeBaseSha(octokit, context, mergeCommitSha) : null);
+
+  // Folder checks for added files read the version's layout as it was when
+  // the backport branch was created. Reading the live branch would see this
+  // run's own earlier deletions, so a replacement file in a folder whose last
+  // file this PR deletes would wrongly look like it has no folder. Resolve the
+  // commit before the loop writes anything.
+  const needsLayoutRef = files.some(file =>
+    file.filename.startsWith(`${sourceFolder}/`) &&
+    (file.status === 'added' ||
+      ((file.status === 'renamed' || file.status === 'copied') &&
+        !file.previous_filename?.startsWith(`${sourceFolder}/`))));
+  const layoutRef = branchBaseSha ||
+    (needsLayoutRef ? await getBranchHeadSha(octokit, context, branchName) : branchName);
 
   for (const file of files) {
     try {
@@ -716,8 +763,19 @@ export async function backportFiles(
       // Check if the target file already exists, and fetch its content so we
       // can attempt a patch merge instead of a blind overwrite.
       const existingTargetFile = await getFileAtRef(octokit, context, targetPath, branchName);
-      if (!existingTargetFile) {
-        core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
+
+      // A modified file that this version lacks at the same path usually lives
+      // at a different path here, because the docs were restructured after the
+      // version was cut. Writing the full post-image would publish a second
+      // copy of the page, so leave it for a person to place.
+      if (effectiveStatus === 'modified' && !existingTargetFile) {
+        core.warning(
+          `Target path ${targetPath} does not exist in this version; the page may live at a different path. ` +
+          `Leaving it for manual review.`
+        );
+        conflicts++;
+        conflictFiles.push(targetPath);
+        continue;
       }
 
       // Reusing an existing destination for an add or rename is ambiguous: it
@@ -738,12 +796,43 @@ export async function backportFiles(
         const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
         const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
         patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchName);
+        // Neither the old nor the new path exists in this version, so the page
+        // is at some other path here, or the version never had it.
+        if (!patchTargetFile) {
+          core.warning(
+            `Neither ${oldTargetPath} nor ${targetPath} exists in this version; the page may live at a ` +
+            `different path. Leaving it for manual review.`
+          );
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+      }
+
+      // A new file whose parent folder this version lacks belongs to a folder
+      // layout the version doesn't have. Creating it would add a new sidebar
+      // section to the old version, so leave it for a person to place.
+      // A root-level file checks the version folder itself, so a missing
+      // version is reported rather than created.
+      if (effectiveStatus === 'added') {
+        const relativeDir = posixDirname(relativePath);
+        const targetDir = relativeDir === '.' ? versionedFolder : `${versionedFolder}/${relativeDir}`;
+        if (!(await directoryExistsAtRef(octokit, context, targetDir, layoutRef))) {
+          core.warning(
+            `Folder ${targetDir} does not exist in this version, so ${targetPath} has no ` +
+            `matching place in its layout. Leaving it for manual review.`
+          );
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+        core.info(`Target file doesn't exist yet, will create: ${targetPath}`);
       }
 
       // Modified and renamed files may have independent version-specific
       // history. Apply only this PR's before/after diff to that current text.
-      // Added files, and files this version has never had, have no prior state
-      // to protect, so preserve and copy their original bytes directly.
+      // Added files have no prior state to protect, so preserve and copy their
+      // original bytes directly.
       let finalContent = afterBase64;
       let isMerge = false;
       let patchTexts: { before: string; after: string } | null = null;
@@ -1012,9 +1101,10 @@ export async function createBackportPR(
 
   let body = `This PR backports changes from ${mainFolder} to version v${version}.\n\nOriginal PR: #${originalPRNumber}`;
   if (conflictFiles.length > 0) {
-    body += `\n\n## Manual review needed\n\nThe following files could not be merged automatically because their ` +
-      `content in this version has diverged from what the original PR changed. They were left unchanged here; ` +
-      `please backport the relevant changes by hand:\n\n${conflictFiles.map(f => `- \`${f}\``).join('\n')}`;
+    body += `\n\n## Manual review needed\n\nThe following files could not be merged automatically. Either their ` +
+      `content in this version has diverged from what the original PR changed, or this version has no file or ` +
+      `folder at the same path, often because the docs were restructured after this version. They were left ` +
+      `unchanged here; please backport the relevant changes by hand, at this version's own path:\n\n${conflictFiles.map(f => `- \`${f}\``).join('\n')}`;
   }
 
   // Create a PR
@@ -1049,8 +1139,9 @@ export async function postConflictComment(
   conflictFiles: string[]
 ): Promise<string | null> {
   const body = `The automated backport of this PR to \`${mainFolder}\` v${version} could not merge the ` +
-    `following files, because their content in that version has diverged from what this PR changed. ` +
-    `They were left unchanged; please backport the relevant changes by hand:\n\n` +
+    `following files. Either their content in that version has diverged from what this PR changed, or that ` +
+    `version has no file or folder at the same path, often because the docs were restructured after that ` +
+    `version. They were left unchanged; please backport the relevant changes by hand, at that version's own path:\n\n` +
     conflictFiles.map(f => `- \`${f}\``).join('\n');
 
   const { data: comment } = await octokit.rest.issues.createComment({
