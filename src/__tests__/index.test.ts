@@ -33,7 +33,8 @@ describe('Docs Backport Action Tests', () => {
                   {
                     number: 456,
                     title: 'Backport: vcluster changes to v0.24',
-                    body: 'Original PR: #123'
+                    body: 'Original PR: #123',
+                    base: { ref: 'main' }
                   }
                 ]
               })
@@ -45,7 +46,8 @@ describe('Docs Backport Action Tests', () => {
         repo: {
           owner: 'loft-sh',
           repo: 'vcluster-docs'
-        }
+        },
+        payload: { repository: { default_branch: 'main' } }
       };
       
       const result = await index.checkExistingBackportPR(
@@ -69,7 +71,8 @@ describe('Docs Backport Action Tests', () => {
                 {
                   number: 789,
                   title: '[v0.24] Fix some issue (#123)',
-                  body: 'Original PR: #123'
+                  body: 'Original PR: #123',
+                  base: { ref: 'main' }
                 }
               ]
             })
@@ -81,7 +84,8 @@ describe('Docs Backport Action Tests', () => {
         repo: {
           owner: 'loft-sh',
           repo: 'vcluster-docs'
-        }
+        },
+        payload: { repository: { default_branch: 'main' } }
       };
       
       const result = await index.checkExistingBackportPR(
@@ -108,6 +112,7 @@ describe('Docs Backport Action Tests', () => {
                     number: 456,
                     title: '[v0.24] Some title (#123)',
                     body: 'Original PR: #123',
+                    base: { ref: 'main' },
                     state: 'closed'
                   }
                 ]
@@ -120,7 +125,8 @@ describe('Docs Backport Action Tests', () => {
         repo: {
           owner: 'loft-sh',
           repo: 'vcluster-docs'
-        }
+        },
+        payload: { repository: { default_branch: 'main' } }
       };
       
       const result = await index.checkExistingBackportPR(
@@ -134,6 +140,79 @@ describe('Docs Backport Action Tests', () => {
       expect(result).not.toBeNull();
       expect(result.number).toBe(456);
       expect(mockOctokit.rest.pulls.list).toHaveBeenCalledTimes(2);
+    });
+
+    it('finds an existing merged backport on a later closed PR page', async () => {
+      const oldPRs = Array.from({ length: 100 }, (_, index) => ({
+        number: 900 - index,
+        title: `Unrelated PR ${index}`,
+        body: '',
+        base: { ref: 'main' }
+      }));
+      const mockOctokit = {
+        rest: {
+          pulls: {
+            list: jest.fn(({ state, page }: any) => {
+              if (state === 'open') return Promise.resolve({ data: [] });
+              if (page === 1) return Promise.resolve({ data: oldPRs });
+              return Promise.resolve({ data: [{
+                number: 456,
+                title: '[v0.24] Some title (#123)',
+                body: 'Original PR: #123',
+                base: { ref: 'main' },
+                state: 'closed',
+                merged_at: '2026-01-01T00:00:00Z'
+              }] });
+            })
+          }
+        }
+      };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+
+      const result = await index.checkExistingBackportPR(mockOctokit, context, 'vcluster', '0.24', 123);
+
+      expect(result.number).toBe(456);
+      expect(mockOctokit.rest.pulls.list).toHaveBeenCalledWith(expect.objectContaining({ state: 'closed', page: 2 }));
+    });
+
+    it('does not treat a matching PR targeting another base as an existing backport', async () => {
+      const mockOctokit = {
+        rest: { pulls: { list: jest.fn(({ state }: any) => Promise.resolve({ data: state === 'open' ? [{
+          number: 456,
+          title: '[v0.24] Some title (#123)',
+          body: 'Original PR: #123',
+          base: { ref: 'next' }
+        }] : [] })) } }
+      };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+
+      const result = await index.checkExistingBackportPR(mockOctokit, context, 'vcluster', '0.24', 123);
+
+      expect(result).toBeNull();
+    });
+
+    it('fails closed when the existing PR search reaches its page limit', async () => {
+      const mockOctokit = { rest: { pulls: { list: jest.fn(({ state }: any) => Promise.resolve({
+        data: state === 'open' ? [] : Array.from({ length: 100 }, (_, index) => ({
+          number: 1000 - index,
+          title: `Unrelated PR ${index}`,
+          body: '',
+          base: { ref: 'main' }
+        }))
+      })) } } };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+
+      await expect(index.checkExistingBackportPR(mockOctokit, context, 'vcluster', '0.24', 123))
+        .rejects.toThrow('exceeded 100 pages');
+      expect(mockOctokit.rest.pulls.list).toHaveBeenCalledTimes(101); // one open page plus one hundred closed pages
+    });
+
+    it('fails closed when listing existing backport PRs fails', async () => {
+      const mockOctokit = { rest: { pulls: { list: jest.fn().mockRejectedValue(new Error('API unavailable')) } } };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+
+      await expect(index.checkExistingBackportPR(mockOctokit, context, 'vcluster', '0.24', 123))
+        .rejects.toThrow('API unavailable');
     });
     
     it('returns null when no PR exists', async () => {
@@ -150,7 +229,8 @@ describe('Docs Backport Action Tests', () => {
         repo: {
           owner: 'loft-sh',
           repo: 'vcluster-docs'
-        }
+        },
+        payload: { repository: { default_branch: 'main' } }
       };
       
       const result = await index.checkExistingBackportPR(
@@ -162,6 +242,36 @@ describe('Docs Backport Action Tests', () => {
       );
       
       expect(result).toBeNull();
+    });
+  });
+
+  describe('Backport branch replay protection', () => {
+    it('uses a stable source and target key and skips the same signal on replay', async () => {
+      const branchName = index.backportBranchName('vcluster', '0.24', 123);
+      expect(branchName).toBe('backport/vcluster-to-0.24-pr-123');
+
+      let branchExists = false;
+      const getRef = jest.fn(async () => {
+        if (!branchExists) throw { status: 404 };
+        return { data: { ref: `refs/heads/${branchName}` } };
+      });
+      const octokit = { rest: { git: { getRef } } };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+
+      // First delivery reaches the write step; record its stable branch.
+      expect(await index.backportBranchExists(octokit, context, branchName)).toBe(false);
+      branchExists = true;
+      // A replay of the same source PR and target sees the first run's branch.
+      expect(await index.backportBranchExists(octokit, context,
+        index.backportBranchName('vcluster', '0.24', 123))).toBe(true);
+      expect(getRef).toHaveBeenCalledTimes(2);
+    });
+
+    it('fails closed when checking the deterministic branch fails', async () => {
+      const octokit = { rest: { git: { getRef: jest.fn().mockRejectedValue(new Error('API unavailable')) } } };
+      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
+      await expect(index.backportBranchExists(octokit, context, 'backport/vcluster-to-0.24-pr-123'))
+        .rejects.toThrow('API unavailable');
     });
   });
   
@@ -328,7 +438,9 @@ describe('Docs Backport Action Tests', () => {
             create: jest.fn().mockResolvedValue({ data: { number: 456 } })
           },
           git: {
-            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'main-sha' } } }),
+            getRef: jest.fn(({ ref }: any) => ref.includes('-pr-123')
+              ? Promise.reject({ status: 404 })
+              : Promise.resolve({ data: { object: { sha: 'main-sha' } } })),
             createRef: jest.fn().mockResolvedValue({})
           },
           issues: {
@@ -2247,6 +2359,7 @@ describe('Docs Backport Action Tests', () => {
     // already exists in the version, and a target read that rejects with a
     // non-404 error fails that version outright.
     const buildOctokit = ({ existing = [] as string[], broken = [] as string[] } = {}) => {
+      const refs = new Set<string>();
       const getContent = jest.fn().mockImplementation(({ path, ref }: any) => {
         if (path === 'vcluster/guide.mdx' && ref === 'merge-sha') {
           return Promise.resolve({ data: { content: Buffer.from('new guide').toString('base64') } });
@@ -2276,8 +2389,15 @@ describe('Docs Backport Action Tests', () => {
             create: jest.fn().mockResolvedValue({ data: { number: 456 } })
           },
           git: {
-            getRef: jest.fn().mockResolvedValue({ data: { object: { sha: 'main-sha' } } }),
-            createRef: jest.fn().mockResolvedValue({})
+            getRef: jest.fn(({ ref }: any) => {
+              if (refs.has(ref)) return Promise.resolve({ data: { object: { sha: 'backport-sha' } } });
+              if (ref.startsWith('heads/backport/')) return Promise.reject({ status: 404 });
+              return Promise.resolve({ data: { object: { sha: 'main-sha' } } });
+            }),
+            createRef: jest.fn(({ ref }: any) => {
+              refs.add(ref.replace(/^refs\//, ''));
+              return Promise.resolve({});
+            })
           },
           issues: {
             addLabels: jest.fn().mockResolvedValue({}),
@@ -2336,6 +2456,62 @@ describe('Docs Backport Action Tests', () => {
       expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
       expect(outputs()).toEqual({ conflicts: '', summary: '' });
       expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('skips branch and PR writes when the same signal is replayed', async () => {
+      const mockOctokit = buildOctokit();
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+      await index.run();
+
+      expect(mockOctokit.rest.git.createRef).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalledTimes(1);
+      expect(mockCore.info).toHaveBeenCalledWith(
+        'Backport branch backport/vcluster-to-0.37-pr-123 already exists for PR #123, skipping'
+      );
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('skips when a concurrent run creates the deterministic branch first', async () => {
+      const mockOctokit = buildOctokit();
+      let branchChecks = 0;
+      mockOctokit.rest.git.getRef.mockImplementation(({ ref }: any) => {
+        if (ref.startsWith('heads/backport/')) {
+          branchChecks++;
+          return branchChecks === 1
+            ? Promise.reject({ status: 404 })
+            : Promise.resolve({ data: { object: { sha: 'concurrent-sha' } } });
+        }
+        return Promise.resolve({ data: { object: { sha: 'main-sha' } } });
+      });
+      mockOctokit.rest.git.createRef.mockRejectedValueOnce({ status: 422 });
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(
+        'Backport branch backport/vcluster-to-0.37-pr-123 was created concurrently, skipping'
+      );
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('fails safely when createRef returns 422 but the deterministic branch is absent', async () => {
+      const mockOctokit = buildOctokit();
+      mockOctokit.rest.git.createRef.mockRejectedValueOnce({ status: 422 });
+      mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
+      setContext(['backport-v0.37']);
+
+      await index.run();
+
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('branch does not exist'));
     });
 
     it('leaves both outputs empty when the run is skipped', async () => {
