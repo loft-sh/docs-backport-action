@@ -191,22 +191,6 @@ describe('Docs Backport Action Tests', () => {
       expect(result).toBeNull();
     });
 
-    it('fails closed when the existing PR search reaches its page limit', async () => {
-      const mockOctokit = { rest: { pulls: { list: jest.fn(({ state }: any) => Promise.resolve({
-        data: state === 'open' ? [] : Array.from({ length: 100 }, (_, index) => ({
-          number: 1000 - index,
-          title: `Unrelated PR ${index}`,
-          body: '',
-          base: { ref: 'main' }
-        }))
-      })) } } };
-      const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
-
-      await expect(index.checkExistingBackportPR(mockOctokit, context, 'vcluster', '0.24', 123))
-        .rejects.toThrow('exceeded 100 pages');
-      expect(mockOctokit.rest.pulls.list).toHaveBeenCalledTimes(101); // one open page plus one hundred closed pages
-    });
-
     it('fails closed when listing existing backport PRs fails', async () => {
       const mockOctokit = { rest: { pulls: { list: jest.fn().mockRejectedValue(new Error('API unavailable')) } } };
       const context = { repo: { owner: 'loft-sh', repo: 'vcluster-docs' }, payload: { repository: { default_branch: 'main' } } };
@@ -441,7 +425,8 @@ describe('Docs Backport Action Tests', () => {
             getRef: jest.fn(({ ref }: any) => ref.includes('-pr-123')
               ? Promise.reject({ status: 404 })
               : Promise.resolve({ data: { object: { sha: 'main-sha' } } })),
-            createRef: jest.fn().mockResolvedValue({})
+            createRef: jest.fn().mockResolvedValue({}),
+            deleteRef: jest.fn().mockResolvedValue({})
           },
           issues: {
             addLabels: jest.fn().mockResolvedValue({})
@@ -2360,6 +2345,7 @@ describe('Docs Backport Action Tests', () => {
     // non-404 error fails that version outright.
     const buildOctokit = ({ existing = [] as string[], broken = [] as string[] } = {}) => {
       const refs = new Set<string>();
+      const prs: any[] = [];
       const getContent = jest.fn().mockImplementation(({ path, ref }: any) => {
         if (path === 'vcluster/guide.mdx' && ref === 'merge-sha') {
           return Promise.resolve({ data: { content: Buffer.from('new guide').toString('base64') } });
@@ -2385,19 +2371,24 @@ describe('Docs Backport Action Tests', () => {
             createOrUpdateFileContents: jest.fn().mockResolvedValue({})
           },
           pulls: {
-            list: jest.fn().mockResolvedValue({ data: [] }),
-            create: jest.fn().mockResolvedValue({ data: { number: 456 } })
+            list: jest.fn(({ state }: any) => Promise.resolve({ data: state === 'open' ? prs : [] })),
+            create: jest.fn(({ title, body, base }: any) => {
+              const pr = { number: 456, title, body, base: { ref: base } };
+              prs.push(pr);
+              return Promise.resolve({ data: pr });
+            })
           },
           git: {
             getRef: jest.fn(({ ref }: any) => {
               if (refs.has(ref)) return Promise.resolve({ data: { object: { sha: 'backport-sha' } } });
-              if (ref.startsWith('heads/backport/')) return Promise.reject({ status: 404 });
+              if (ref.startsWith('heads/backport/') || ref.startsWith('heads/backport-lock/')) return Promise.reject({ status: 404 });
               return Promise.resolve({ data: { object: { sha: 'main-sha' } } });
             }),
             createRef: jest.fn(({ ref }: any) => {
               refs.add(ref.replace(/^refs\//, ''));
               return Promise.resolve({});
-            })
+            }),
+            deleteRef: jest.fn(({ ref }: any) => { refs.delete(ref); return Promise.resolve({}); })
           },
           issues: {
             addLabels: jest.fn().mockResolvedValue({}),
@@ -2466,37 +2457,27 @@ describe('Docs Backport Action Tests', () => {
       await index.run();
       await index.run();
 
-      expect(mockOctokit.rest.git.createRef).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.git.createRef).toHaveBeenCalledTimes(2);
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(1);
       expect(mockOctokit.rest.pulls.create).toHaveBeenCalledTimes(1);
       expect(mockCore.info).toHaveBeenCalledWith(
-        'Backport branch backport/vcluster-to-0.37-pr-123 already exists for PR #123, skipping'
+        'Backport PR #456 already exists for vcluster to v0.37, skipping'
       );
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
-    it('skips when a concurrent run creates the deterministic branch first', async () => {
+    it('skips when another writer owns the lock', async () => {
       const mockOctokit = buildOctokit();
-      let branchChecks = 0;
-      mockOctokit.rest.git.getRef.mockImplementation(({ ref }: any) => {
-        if (ref.startsWith('heads/backport/')) {
-          branchChecks++;
-          return branchChecks === 1
-            ? Promise.reject({ status: 404 })
-            : Promise.resolve({ data: { object: { sha: 'concurrent-sha' } } });
-        }
-        return Promise.resolve({ data: { object: { sha: 'main-sha' } } });
-      });
+      mockOctokit.rest.git.getRef.mockResolvedValue({ data: { object: { sha: 'main-sha' } } });
       mockOctokit.rest.git.createRef.mockRejectedValueOnce({ status: 422 });
       mockGithub.getOctokit = jest.fn().mockReturnValue(mockOctokit);
       setContext(['backport-v0.37']);
-
       await index.run();
-
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.git.deleteRef).not.toHaveBeenCalled();
       expect(mockCore.info).toHaveBeenCalledWith(
-        'Backport branch backport/vcluster-to-0.37-pr-123 was created concurrently, skipping'
+        'Backport writer lock backport-lock/vcluster-to-0.37-pr-123 is held, skipping concurrent delivery'
       );
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
