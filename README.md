@@ -68,6 +68,12 @@ Add labels to PRs to specify which version(s) to backport to:
 - `backport-v0.22` - Backport to vcluster v0.22
 - `backport-v4.2` - Backport to platform v4.2
 
+## Retrying a failed backport
+
+Rerun the failed job. The action resumes its deterministic `backport/<folder>-to-<version>-pr-<number>` branch, skips completed writes, and opens the missing PR. Folder checks and rename patches use the branch's original merge base with the default branch. Keep these branches owned by the action; do not merge the default branch into them while recovering a failed run.
+
+A `backport-lock/<folder>-to-<version>-pr-<number>` branch acts as an atomic writer lock. Concurrent deliveries skip while it exists. Handled failures release it so a retry can continue. A cancelled job or killed runner may leave the lock behind. If a retry logs that the lock is held, confirm that all writers for that source PR and target have stopped, then remove only the matching lock branch and rerun. Keep the `backport/` branch and its changes.
+
 ## Development
 
 ### Prerequisites

@@ -166,7 +166,7 @@ export async function run(): Promise<void> {
         continue;
       }
       
-      // Check if a backport PR already exists for this PR and version
+      // Check if a backport PR already exists for this PR and version.
       const existingPR = await checkExistingBackportPR(
         octokit, 
         context, 
@@ -179,86 +179,111 @@ export async function run(): Promise<void> {
         core.info(`Backport PR #${existingPR.number} already exists for ${targetMainFolder} to v${version}, skipping`);
         continue;
       }
-      
-      // Construct the versioned folder path based on our folder structure
-      // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
-      // For vcluster versions, always add .0 suffix
-      let formattedVersion = version;
-      if (targetMainFolder === 'vcluster') {
-        formattedVersion = `${version}.0`;
-      }
-      const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
 
-      if (!preMergeBaseShaPromise) {
-        preMergeBaseShaPromise = getPreMergeBaseSha(octokit, context, mergeCommitSha);
+      const branchName = backportBranchName(targetMainFolder, version, prNumber);
+      // A separate ref protects both new branches and resumes. createRef is
+      // atomic; only its owner may write or release it. Recheck PRs inside the
+      // lock because a delivery may have finished since the first lookup.
+      const lockName = branchName.replace('backport/', 'backport-lock/');
+      const defaultBranch = context.payload.repository!.default_branch;
+      const lockSha = await getBranchHeadSha(octokit, context, defaultBranch);
+      if (!(await acquireBackportLock(octokit, context, lockName, lockSha))) {
+        continue;
       }
-      const preMergeBaseSha = await preMergeBaseShaPromise;
-      
-      // Create a branch for this backport
-      const timestamp = new Date().getTime();
-      const branchName = `backport/${targetMainFolder}-to-${version}-${timestamp}`;
-      
-      // Create the branch
-      const branchBaseSha = await createBranchForBackport(octokit, context, branchName);
-      
-      // Process files and get stats
-      const stats = await backportFiles(
-        octokit, 
-        context, 
-        targetMainFolder, 
-        versionedFolder, 
-        changedFiles, 
-        branchName,
-        preMergeBaseSha,
-        branchBaseSha
-      );
+      try {
+        if (await checkExistingBackportPR(octokit, context, targetMainFolder, version, prNumber)) {
+          continue;
+        }
+        const resuming = await backportBranchExists(octokit, context, branchName);
 
-      // Never open a normal-looking PR when one or more files failed to
-      // process. The per-file warnings remain in the job log, while failing
-      // the action makes the incomplete backport impossible to overlook.
-      if (stats.errors > 0) {
-        throw new Error(
-          `Backport to ${targetMainFolder} v${version} failed for ${stats.errors} file(s); ` +
-          `no pull request was created`
-        );
-      }
-      
-      // Only create a PR if we successfully copied or deleted at least one file
-      if (stats.copied > 0 || stats.deleted > 0) {
-        // Get original PR title
-        const originalPRTitle = context.payload.pull_request.title;
+        // Construct the versioned folder path based on our folder structure
+        // For vcluster, ensure we add .0 suffix if it's missing and version doesn't already have minor part
+        // For vcluster versions, always add .0 suffix
+        let formattedVersion = version;
+        if (targetMainFolder === 'vcluster') {
+          formattedVersion = `${version}.0`;
+        }
+        const versionedFolder = `${FOLDER_MAPPING[targetMainFolder]}/version-${formattedVersion}`;
 
-        // Create a PR
-        await createBackportPR(
+        if (!preMergeBaseShaPromise) {
+          preMergeBaseShaPromise = getPreMergeBaseSha(octokit, context, mergeCommitSha);
+        }
+        const preMergeBaseSha = await preMergeBaseShaPromise;
+
+        // Resume the branch or create it on the default branch.
+        // The merge base survives main advancing and earlier file deletions.
+        // Branches are action-owned and never merge main while being written.
+        const previous = resuming ? await octokit.rest.repos.compareCommits({
+          ...context.repo, base: defaultBranch, head: branchName
+        }) : null;
+        const branchBaseSha = previous
+          ? previous.data.merge_base_commit.sha
+          : await createBranchForBackport(octokit, context, branchName);
+        if (!branchBaseSha) {
+          continue;
+        }
+
+        // Process files and get stats
+        const stats = await backportFiles(
           octokit,
           context,
-          branchName,
           targetMainFolder,
-          version,
-          prNumber,
-          originalPRTitle,
-          stats.conflictFiles
+          versionedFolder,
+          changedFiles,
+          branchName,
+          preMergeBaseSha,
+          branchBaseSha
         );
-      } else {
-        core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
-      }
 
-      // Conflicts need a human regardless of whether a backport PR got
-      // created (an all-conflicts backport has nothing to open a PR with,
-      // since nothing was actually committed to the branch).
-      // Record the conflict before commenting, so a failed comment still
-      // reaches the outputs.
-      if (stats.conflictFiles.length > 0) {
-        const report: ConflictReport = {
-          folder: targetMainFolder,
-          version,
-          files: stats.conflictFiles,
-          comment_url: null
-        };
-        conflictReports.push(report);
-        report.comment_url = await postConflictComment(
-          octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles
-        );
+        // Never open a normal-looking PR when one or more files failed to
+        // process. The per-file warnings remain in the job log, while failing
+        // the action makes the incomplete backport impossible to overlook.
+        if (stats.errors > 0) {
+          throw new Error(
+            `Backport to ${targetMainFolder} v${version} failed for ${stats.errors} file(s); ` +
+            `no pull request was created`
+          );
+        }
+
+        // Prior writes also need a PR after an interrupted attempt.
+        if (stats.copied > 0 || stats.deleted > 0 || ((previous?.data.files?.length || 0) > 0)) {
+          // Get original PR title
+          const originalPRTitle = context.payload.pull_request.title;
+
+          // Create a PR
+          await createBackportPR(
+            octokit,
+            context,
+            branchName,
+            targetMainFolder,
+            version,
+            prNumber,
+            originalPRTitle,
+            stats.conflictFiles
+          );
+        } else {
+          core.info(`No files were successfully copied for ${targetMainFolder} to version ${version}, skipping PR creation`);
+        }
+
+        // Conflicts need a human regardless of whether a backport PR got
+        // created (an all-conflicts backport has nothing to open a PR with,
+        // since nothing was actually committed to the branch).
+        // Record the conflict before commenting, so a failed comment still
+        // reaches the outputs.
+        if (stats.conflictFiles.length > 0) {
+          const report: ConflictReport = {
+            folder: targetMainFolder,
+            version,
+            files: stats.conflictFiles,
+            comment_url: null
+          };
+          conflictReports.push(report);
+          report.comment_url = await postConflictComment(
+            octokit, context, prNumber, targetMainFolder, version, stats.conflictFiles
+          );
+        }
+      } finally {
+        await octokit.rest.git.deleteRef({ ...context.repo, ref: `heads/${lockName}` });
       }
       } catch (error: any) {
         const message = `Backport for v${version} failed: ${error.message}`;
@@ -306,7 +331,7 @@ async function createBranchForBackport(
   octokit: any,
   context: any,
   branchName: string
-): Promise<string> {
+): Promise<string | null> {
   // Get the default branch
   const { data: repo } = await octokit.rest.repos.get({
     ...context.repo
@@ -321,14 +346,67 @@ async function createBranchForBackport(
   });
   
   // Create the new branch
-  await octokit.rest.git.createRef({
-    ...context.repo,
-    ref: `refs/heads/${branchName}`,
-    sha: ref.object.sha
-  });
+  try {
+    await octokit.rest.git.createRef({
+      ...context.repo,
+      ref: `refs/heads/${branchName}`,
+      sha: ref.object.sha
+    });
+  } catch (error: any) {
+    if (error.status === 422) {
+      if (await backportBranchExists(octokit, context, branchName)) {
+        core.info(`Backport branch ${branchName} was created concurrently, skipping`);
+        return null;
+      }
+      throw Object.assign(new Error(`Backport branch ${branchName} creation failed with 422, but the branch does not exist`), { cause: error });
+    }
+    throw error;
+  }
   
   core.info(`Created branch ${branchName}`);
   return ref.object.sha;
+}
+
+// New branches encode the source PR and target, giving retries a stable key.
+// Older timestamp branches cannot be safely associated with a source PR.
+export function backportBranchName(mainFolder: string, version: string, originalPRNumber: number): string {
+  return `backport/${mainFolder}-to-${version}-pr-${originalPRNumber}`;
+}
+
+// Failed attempts retain their branch so the next delivery can finish it.
+// Only 404 means absent; all other lookup errors fail closed.
+export async function backportBranchExists(octokit: any, context: any, branchName: string): Promise<boolean> {
+  try {
+    await octokit.rest.git.getRef({
+      ...context.repo,
+      ref: `heads/${branchName}`
+    });
+    return true;
+  } catch (error: any) {
+    if (error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// A failed file/PR operation releases the lock in run()'s finally block.
+// A forcibly terminated process can leave it behind. Fail closed in that
+// case: an operator must confirm the writer has stopped before removing it.
+async function acquireBackportLock(octokit: any, context: any, name: string, sha: string): Promise<boolean> {
+  try {
+    await octokit.rest.git.createRef({ ...context.repo, ref: `refs/heads/${name}`, sha });
+    return true;
+  } catch (error: any) {
+    if (error.status === 422) {
+      if (await backportBranchExists(octokit, context, name)) {
+        core.info(`Backport writer lock ${name} is held, skipping concurrent delivery`);
+        return false;
+      }
+      throw Object.assign(new Error(`Backport lock creation failed with 422, but the branch does not exist`), { cause: error });
+    }
+    throw error;
+  }
 }
 
 // Interface for backport statistics
@@ -778,24 +856,20 @@ export async function backportFiles(
         continue;
       }
 
-      // Reusing an existing destination for an add or rename is ambiguous: it
-      // may contain version-specific history unrelated to this PR.
-      if ((effectiveStatus === 'added' || effectiveStatus === 'renamed' || effectiveStatus === 'copied') &&
-        existingTargetFile) {
+      if (existingTargetFile && !branchBaseSha && effectiveStatus !== 'modified') {
         core.warning(`Target path ${targetPath} already exists; leaving it unchanged for manual review.`);
         conflicts++;
         conflictFiles.push(targetPath);
         continue;
       }
 
-      // A rename's version-specific state lives at its old path. Always use
-      // that content as the patch target; the new path was checked above for
-      // an explicit destination collision.
+      // A rename's version-specific state lives at its original old path.
+      // Use the immutable base so retries survive a prior deletion there.
       let patchTargetFile = effectiveStatus === 'modified' ? existingTargetFile : null;
       if ((effectiveStatus === 'renamed' || effectiveStatus === 'copied') && file.previous_filename) {
         const oldRelativePath = file.previous_filename.substring(sourceFolder.length + 1);
         const oldTargetPath = `${versionedFolder}/${oldRelativePath}`;
-        patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchName);
+        patchTargetFile = await getFileAtRef(octokit, context, oldTargetPath, branchBaseSha || branchName);
         // Neither the old nor the new path exists in this version, so the page
         // is at some other path here, or the version never had it.
         if (!patchTargetFile) {
@@ -920,6 +994,28 @@ export async function backportFiles(
           finalContent = encodeContent(patchResult.text);
           isMerge = true;
         }
+      }
+
+      if ((effectiveStatus === 'added' || effectiveStatus === 'renamed' || effectiveStatus === 'copied') &&
+        existingTargetFile) {
+        // Equality is safe only when the destination was absent at our base.
+        // Compute rename bytes from the original version-specific old path,
+        // even if a previous attempt already deleted it.
+        const originalTarget = branchBaseSha
+          ? await getFileAtRef(octokit, context, targetPath, branchBaseSha)
+          : existingTargetFile;
+        if (originalTarget || contentBase64(existingTargetFile.content) !== finalContent) {
+          core.warning(`Target path ${targetPath} already exists; leaving it unchanged for manual review.`);
+          conflicts++;
+          conflictFiles.push(targetPath);
+          continue;
+        }
+        if (effectiveStatus === 'renamed' && file.previous_filename) {
+          const oldTargetPath = `${versionedFolder}/${file.previous_filename.substring(sourceFolder.length + 1)}`;
+          if (await deleteVersionedFile(octokit, context, oldTargetPath, branchName) === 'deleted') deleted++;
+        }
+        skipped++;
+        continue;
       }
 
       const commitVerb = isMerge ? 'Merge' : 'Copy';
@@ -1050,39 +1146,53 @@ export async function checkExistingBackportPR(
   version: string,
   originalPRNumber: number
 ): Promise<any | null> {
-  try {
-    // Search for both open and closed PRs that mention the original PR number
-    const states: Array<'open' | 'closed'> = ['open', 'closed'];
-    
-    for (const state of states) {
+  const defaultBranch = context.payload.repository?.default_branch;
+  if (typeof defaultBranch !== 'string' || defaultBranch.length === 0) {
+    throw new Error('Repository default branch is missing; refusing to match a backport PR');
+  }
+
+  // Search all open and closed PR pages. Closed includes merged PRs. A
+  // truncated first page can otherwise let a replay create another backport.
+  const states: Array<'open' | 'closed'> = ['open', 'closed'];
+
+  for (const state of states) {
+    let page = 1;
+    while (true) {
       const { data: prs } = await octokit.rest.pulls.list({
         ...context.repo,
-        state: state,
+        state,
         sort: 'created',
         direction: 'desc',
-        per_page: 100
+        per_page: 100,
+        page
       });
 
-      // Look for PRs with the new title format or body referencing original PR
+      if (!Array.isArray(prs)) {
+        throw new Error(`GitHub returned an invalid ${state} pull request page`);
+      }
+
       for (const pr of prs) {
-        // Check for new title format: [vX.Y] original title (#PR_NUMBER)
+        if (pr.base?.ref !== defaultBranch) {
+          continue;
+        }
         const matchesNewTitleFormat = pr.title.includes(`[v${version}]`) && pr.title.includes(`(#${originalPRNumber})`);
-        // Also check legacy format for backward compatibility
         const matchesLegacyTitle = pr.title.includes(`${mainFolder} changes to v${version}`);
         const referencesOriginalPR = pr.body && pr.body.includes(`Original PR: #${originalPRNumber}`);
-        
-        if ((matchesNewTitleFormat || (matchesLegacyTitle && referencesOriginalPR))) {
+
+        if (matchesNewTitleFormat || (matchesLegacyTitle && referencesOriginalPR)) {
           core.info(`Found existing ${state} backport PR #${pr.number} for ${mainFolder} to v${version} from PR #${originalPRNumber}`);
           return pr;
         }
       }
+
+      if (prs.length < 100) {
+        break;
+      }
+      page++;
     }
-    
-    return null;
-  } catch (error: any) {
-    core.warning(`Error checking for existing backport PRs: ${error.message}`);
-    return null;
   }
+
+  return null;
 }
 
 // Exported for testing
